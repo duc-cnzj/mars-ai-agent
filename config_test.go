@@ -16,6 +16,7 @@ func TestLoadEnv_Defaults(t *testing.T) {
 	t.Setenv("HOME", "")
 	t.Setenv("MARS_LLM_BASE_URL", "")
 	t.Setenv("MARS_MCP_URL", "")
+	t.Setenv("MARS_GRAY", "")
 
 	env, err := LoadEnv()
 	if err != nil {
@@ -33,6 +34,9 @@ func TestLoadEnv_Defaults(t *testing.T) {
 	// LLM/MCP 地址覆盖项缺省为空，由 BuildConfig 回落到网关约定路径。
 	if env.LLMBaseURL != "" || env.MCPURL != "" {
 		t.Errorf("覆盖项缺省应为空, got LLMBaseURL=%q MCPURL=%q", env.LLMBaseURL, env.MCPURL)
+	}
+	if env.Gray != "" {
+		t.Errorf("Gray = %q, want 空（非灰度）", env.Gray)
 	}
 }
 
@@ -153,6 +157,54 @@ func TestBuildConfig_Overrides(t *testing.T) {
 	}
 	if got := cfg.MCP["mars-tools"].URL; got != "https://mcp.example.com/sse" {
 		t.Errorf("mcp url = %q, want 覆盖值并去尾斜杠", got)
+	}
+}
+
+// TestBuildConfig_GrayHeader 验证灰度用户的 LLM 与 MCP 请求都带上 mars_gray 路由头，
+// 且非灰度时该头完全不出现在落盘配置里。
+func TestBuildConfig_GrayHeader(t *testing.T) {
+	tests := []struct {
+		name string
+		gray string
+		want bool
+	}{
+		{"灰度用户", "always", true},
+		{"非灰度用户", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := BuildConfig(Env{GatewayURL: "http://gw:9000", Model: "m1", Gray: tt.gray})
+
+			llmHdr := cfg.Provider[providerID].Options.Headers
+			mcpHdr := cfg.MCP["mars-tools"].Headers
+			if tt.want {
+				if llmHdr["mars_gray"] != "always" {
+					t.Errorf("provider headers = %v, want mars_gray=always", llmHdr)
+				}
+				if mcpHdr["mars_gray"] != "always" {
+					t.Errorf("mcp headers = %v, want mars_gray=always", mcpHdr)
+				}
+			} else {
+				if llmHdr != nil {
+					t.Errorf("非灰度 provider headers = %v, want nil（不落盘）", llmHdr)
+				}
+				if _, ok := mcpHdr["mars_gray"]; ok {
+					t.Errorf("非灰度 mcp headers 不应含 mars_gray: %v", mcpHdr)
+				}
+			}
+			// Authorization 始终保留，灰度头只做叠加。
+			if mcpHdr["Authorization"] != "Bearer "+tokenEnvPlaceholder {
+				t.Errorf("mcp Authorization = %q", mcpHdr["Authorization"])
+			}
+
+			data, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if got := strings.Contains(string(data), "mars_gray"); got != tt.want {
+				t.Errorf("序列化含 mars_gray = %v, want %v: %s", got, tt.want, data)
+			}
+		})
 	}
 }
 

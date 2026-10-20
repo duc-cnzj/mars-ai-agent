@@ -28,12 +28,16 @@ const (
 	mcpPath      = "/mcp"
 )
 
+// grayHeaderName 是 nginx-ingress canary 读取的灰度路由头；值为 always 时固定路由到灰度通道。
+const grayHeaderName = "mars_gray"
+
 // Env 是 mars-agent 启动所需的全部环境变量（由沙箱 Pod manifest 注入）。
 type Env struct {
 	GatewayURL   string // MARS_GATEWAY_URL：mars 网关地址（提供 MCP 工具 + LLM 代理）
 	LLMBaseURL   string // MARS_LLM_BASE_URL：可选，LLM 完整 baseURL 覆盖（绕过 <gateway>/llm/v1 约定）
 	MCPURL       string // MARS_MCP_URL：可选，MCP 工具服务完整 URL 覆盖（绕过 <gateway>/mcp 约定）
 	SessionToken string // MARS_SESSION_TOKEN：短期 scoped JWT，MCP、LLM 与配置接口共用
+	Gray         string // MARS_GRAY：灰度通道标记（always=灰度用户，空=非灰度）；由入口脚本探测后注入
 	Model        string // MARS_MODEL：模型 id（裸 id）；由入口脚本从 mars /api/ai/config 拉取后注入
 	AIBin        string // MARS_AI_BIN：底层 agent 二进制路径（默认 opencode，可替换其他内核）
 	ListenAddr   string // MARS_LISTEN_ADDR：opencode serve 监听地址
@@ -56,6 +60,7 @@ func LoadEnv() (Env, error) {
 		LLMBaseURL:   os.Getenv("MARS_LLM_BASE_URL"),
 		MCPURL:       os.Getenv("MARS_MCP_URL"),
 		SessionToken: os.Getenv("MARS_SESSION_TOKEN"),
+		Gray:         os.Getenv("MARS_GRAY"),
 		Model:        os.Getenv("MARS_MODEL"),
 		AIBin:        getenvDefault("MARS_AI_BIN", "/usr/local/bin/opencode"),
 		ListenAddr:   getenvDefault("MARS_LISTEN_ADDR", "0.0.0.0:4096"),
@@ -98,6 +103,9 @@ type Provider struct {
 type ProviderOptions struct {
 	BaseURL string `json:"baseURL"`
 	APIKey  string `json:"apiKey"`
+	// Headers 会由 opencode 原样附加到每次 LLM 请求上（灰度用户在这里带 mars_gray）。
+	// 非灰度时为 nil，omitempty 保证不落盘空对象。
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // ProviderModel 描述一个可选模型。
@@ -129,6 +137,7 @@ func BuildConfig(env Env) Config {
 				Options: ProviderOptions{
 					BaseURL: llmBaseURL(env),
 					APIKey:  tokenEnvPlaceholder,
+					Headers: grayHeaders(env.Gray),
 				},
 				Models: map[string]ProviderModel{
 					env.Model: {Name: "Mars Pinned"},
@@ -138,11 +147,9 @@ func BuildConfig(env Env) Config {
 		Model: providerID + "/" + env.Model,
 		MCP: map[string]MCPServer{
 			"mars-tools": {
-				Type: "remote",
-				URL:  mcpServerURL(env),
-				Headers: map[string]string{
-					"Authorization": "Bearer " + tokenEnvPlaceholder,
-				},
+				Type:    "remote",
+				URL:     mcpServerURL(env),
+				Headers: mcpHeaders(env.Gray),
 			},
 		},
 	}
@@ -163,4 +170,23 @@ func mcpServerURL(env Env) string {
 		return strings.TrimRight(env.MCPURL, "/")
 	}
 	return strings.TrimRight(env.GatewayURL, "/") + mcpPath
+}
+
+// grayHeaders 返回访问 mars 时需要附加的灰度路由头：灰度用户带 mars_gray: always，
+// 非灰度返回 nil（ProviderOptions.Headers 的 omitempty 会让它不落盘）。
+// 取值直接沿用入口脚本从 /api/auth/info 读到的 MARS_GRAY，本包不再二次判断。
+func grayHeaders(gray string) map[string]string {
+	if gray == "" {
+		return nil
+	}
+	return map[string]string{grayHeaderName: gray}
+}
+
+// mcpHeaders 组装 MCP 请求头：Authorization 恒有；灰度用户再叠加灰度路由头。
+func mcpHeaders(gray string) map[string]string {
+	headers := map[string]string{"Authorization": "Bearer " + tokenEnvPlaceholder}
+	for k, v := range grayHeaders(gray) {
+		headers[k] = v
+	}
+	return headers
 }

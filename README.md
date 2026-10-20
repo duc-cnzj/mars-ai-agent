@@ -24,6 +24,7 @@ mars「AI 容器排查助手」的**沙箱侧组件**。每个用户独占一个
 | `MARS_GATEWAY_URL` | ✅ | — | mars 网关地址（MCP + LLM 代理 + 运行时配置），如 `http://mars-server.mars.svc:9000` |
 | `MARS_SESSION_TOKEN` | ✅ | — | 短期 scoped JWT，MCP、LLM 与配置接口共用；**绝不接受用户真实 token** |
 | `MARS_MODEL` | | 由入口脚本拉取 | 模型 id（裸 id，非 provider 限定名；配置里会写成 `mars/<id>`）。显式设置时跳过拉取 |
+| `MARS_GRAY` | | 由入口脚本探测 | 灰度通道标记（`always`=灰度用户，空=非灰度）。非空时 LLM 与 MCP 请求都带 `mars_gray` 头；显式设置时跳过探测 |
 | `MARS_AI_BIN` | | `/usr/local/bin/opencode` | 底层 agent 二进制路径（`mai` 与服务进程共用；可替换成 claude code 等） |
 | `MARS_LISTEN_ADDR` | | `0.0.0.0:4096` | opencode serve 监听地址 |
 | `HOME` | | `/workspace` | 配置与 skills 的落盘根（`$HOME/.config/opencode/`） |
@@ -38,6 +39,22 @@ Authorization: Bearer <MARS_SESSION_TOKEN>
 
 非 200、响应无法解析或 `model` 为空都会打印原因并以非 0 退出（fail fast），
 不让沙箱带着坏配置起来。接口的服务端实现与路径契约见 mars 仓 `internal/services/aiconfig.go`。
+
+启动时还会探测一次灰度通道，决定后续所有发往 mars 的请求是否带 `mars_gray` 头：
+
+```text
+GET <MARS_GATEWAY_URL>/api/auth/info
+Authorization: Bearer <MARS_SESSION_TOKEN>
+200 → {"isGray":true|false,...}
+```
+
+`isGray=true` 时入口脚本导出 `MARS_GRAY=always`，wrapper 把它写进 opencode 配置：
+LLM 供应商的 `options.headers` 与 MCP 服务的 `headers` 各带一份 `mars_gray: always`，
+由 nginx-ingress canary 把配置、LLM 代理与 MCP 请求固定路由到灰度通道。
+探测失败按非灰度处理（与 mars `/api/auth/info` 的 fail-open 口径一致），不阻断启动；
+探测请求本身是唯一无法携带该头的 mars 请求（此时还不知道结果）。
+**灰度标记不进 JWT**（mars 每次读库），所以沙箱只在容器启动时感知：后台改标后，
+存量沙箱需重启（缩容后再次唤醒即可重新触发探测）才会切换通道。
 
 ## 目录结构
 

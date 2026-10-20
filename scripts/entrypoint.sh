@@ -7,6 +7,9 @@
 #   Authorization: Bearer ${MARS_SESSION_TOKEN}
 #   200 → {"model":"<裸模型 id>"}
 #
+# 灰度用户（GET ${MARS_GATEWAY_URL}/api/auth/info 的 isGray=true）会额外把
+# MARS_GRAY=always 注入环境，wrapper 据此在所有发往 mars 的请求上带 mars_gray 头。
+#
 # wrapper 随后生成 $HOME/.config/opencode/opencode.json（含模型、LLM/MCP 地址）并
 # exec opencode serve。因此用户之后进入 opencode 无需任何额外参数——配置已就绪。
 #
@@ -17,8 +20,40 @@ set -eu
 : "${MARS_GATEWAY_URL:?缺少必填环境变量}"
 : "${MARS_SESSION_TOKEN:?缺少必填环境变量}"
 
+# 灰度通道探测：灰度标记不在 JWT 里（mars 侧每次读库），沙箱只能在启动时问一次。
+# 探测请求本身还没法带灰度头（此时不知道结果），但拿到结果后，后续配置、LLM 代理与
+# MCP 请求都会带上 mars_gray，由 nginx-ingress canary 固定路由到灰度通道。
+# MARS_GRAY 已显式设置时跳过探测（本地联调逃生舱）。
+# 探测失败按非灰度处理（与 mars /api/auth/info 的 fail-open 口径一致），不阻断启动。
+if [ -z "${MARS_GRAY:-}" ]; then
+  info_url="${MARS_GATEWAY_URL%/}/api/auth/info"
+  gray=""
+  if info="$(curl -sS --max-time 10 -H "Authorization: Bearer ${MARS_SESSION_TOKEN}" "$info_url")"; then
+    if [ "$(printf '%s' "$info" | jq -r '.isGray // false' 2>/dev/null)" = "true" ]; then
+      gray="always"
+    fi
+  else
+    echo "mars-agent: 探测灰度通道失败，按非灰度启动: ${info_url}" >&2
+  fi
+  MARS_GRAY="$gray"
+  export MARS_GRAY
+  echo "mars-agent: 灰度通道探测结果: ${MARS_GRAY:-非灰度}"
+fi
+
 if [ -z "${MARS_MODEL:-}" ]; then
   url="${MARS_GATEWAY_URL%/}/api/ai/config"
+
+  # 灰度用户的所有 mars 请求都带路由头；非灰度不带（空值头没有意义）。
+  fetch_config() {
+    if [ -n "${MARS_GRAY:-}" ]; then
+      curl -sS --max-time 10 -w '\n%{http_code}' \
+        -H "Authorization: Bearer ${MARS_SESSION_TOKEN}" \
+        -H "mars_gray: ${MARS_GRAY}" "$url"
+    else
+      curl -sS --max-time 10 -w '\n%{http_code}' \
+        -H "Authorization: Bearer ${MARS_SESSION_TOKEN}" "$url"
+    fi
+  }
 
   # 重试策略：网关刚起来或网络抖动时，单次失败不应让沙箱直接 CrashLoop。
   # 只有网络错误、5xx 与 429 视为瞬时可重试；其余 4xx 是配置/鉴权问题，重试无意义。
@@ -27,8 +62,7 @@ if [ -z "${MARS_MODEL:-}" ]; then
   last_err=""
   while :; do
     # 保留响应体与状态码：失败时把 mars 的说明原样带出来，便于定位是未配置还是鉴权失败。
-    if resp="$(curl -sS --max-time 10 -w '\n%{http_code}' \
-      -H "Authorization: Bearer ${MARS_SESSION_TOKEN}" "$url")"; then
+    if resp="$(fetch_config)"; then
       status="$(printf '%s' "$resp" | tail -n 1)"
       body="$(printf '%s' "$resp" | sed '$d')"
       if [ "$status" = "200" ]; then

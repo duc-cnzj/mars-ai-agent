@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,10 @@ func TestEntrypointRetriesTransientFailure(t *testing.T) {
 
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/auth/info" {
+			_, _ = w.Write([]byte(`{"isGray":false}`))
+			return
+		}
 		if r.URL.Path != "/api/ai/config" {
 			t.Errorf("请求路径 = %s, want /api/ai/config", r.URL.Path)
 		}
@@ -53,6 +58,10 @@ func TestEntrypointFailsFastOnAuthError(t *testing.T) {
 
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/auth/info" {
+			_, _ = w.Write([]byte(`{"isGray":false}`))
+			return
+		}
 		atomic.AddInt32(&calls, 1)
 		http.Error(w, `{"error":"bad token"}`, http.StatusUnauthorized)
 	}))
@@ -91,25 +100,117 @@ func TestEntrypointGivesUpOnNetworkError(t *testing.T) {
 	}
 }
 
+// TestEntrypointGrayHeader 验证灰度探测结果同时作用于「配置请求头」与「传给 wrapper 的环境」：
+// isGray=true → 配置请求带 mars_gray: always，且 MARS_GRAY=always 进入 opencode 环境；
+// isGray=false → 不带该头；显式设置 MARS_GRAY 时跳过探测。
+func TestEntrypointGrayHeader(t *testing.T) {
+	requireTooling(t, "sh", "curl", "jq", "env")
+
+	tests := []struct {
+		name       string
+		isGray     bool
+		extraEnv   []string
+		wantHeader string
+		wantEnv    bool
+		wantProbes int32
+	}{
+		{"灰度用户", true, nil, "always", true, 1},
+		{"非灰度用户", false, nil, "", false, 1},
+		{"显式设置跳过探测", false, []string{"MARS_GRAY=always"}, "always", true, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var probes int32
+			var gotHeader atomic.Value
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/auth/info":
+					atomic.AddInt32(&probes, 1)
+					_, _ = fmt.Fprintf(w, `{"isGray":%t}`, tt.isGray)
+				case "/api/ai/config":
+					gotHeader.Store(r.Header.Get("mars_gray"))
+					_, _ = w.Write([]byte(`{"model":"demo-model"}`))
+				default:
+					t.Errorf("意外请求路径 %s", r.URL.Path)
+				}
+			}))
+			defer srv.Close()
+
+			extra := append([]string{"MARS_AGENT_BIN=/usr/bin/env"}, tt.extraEnv...)
+			stdout, stderr, code := runEntrypoint(t, srv.URL, extra...)
+			if code != 0 {
+				t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr)
+			}
+			if got, _ := gotHeader.Load().(string); got != tt.wantHeader {
+				t.Errorf("配置请求 mars_gray = %q, want %q", got, tt.wantHeader)
+			}
+			if got := atomic.LoadInt32(&probes); got != tt.wantProbes {
+				t.Errorf("灰度探测次数 = %d, want %d", got, tt.wantProbes)
+			}
+			if got := strings.Contains(stdout, "MARS_GRAY=always"); got != tt.wantEnv {
+				t.Errorf("wrapper 环境含 MARS_GRAY=always = %v, want %v", got, tt.wantEnv)
+			}
+		})
+	}
+}
+
+// TestEntrypointGrayProbeFailOpen 探测接口不可用/返回非 JSON 时按非灰度继续启动，
+// 不能因为拿不到灰度标记就让沙箱 CrashLoop。
+func TestEntrypointGrayProbeFailOpen(t *testing.T) {
+	requireTooling(t, "sh", "curl", "jq", "env")
+
+	var gotHeader atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/info":
+			http.Error(w, "boom", http.StatusInternalServerError)
+		case "/api/ai/config":
+			gotHeader.Store(r.Header.Get("mars_gray"))
+			_, _ = w.Write([]byte(`{"model":"demo-model"}`))
+		}
+	}))
+	defer srv.Close()
+
+	_, stderr, code := runEntrypoint(t, srv.URL)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr)
+	}
+	if got, _ := gotHeader.Load().(string); got != "" {
+		t.Errorf("探测失败时不应带 mars_gray，got %q", got)
+	}
+}
+
 // runEntrypoint 以受控环境执行镜像入口脚本，返回 stdout/stderr 与退出码。
-// 继承环境中的 MARS_* 全部剔除，避免宿主机变量干扰断言。
-func runEntrypoint(t *testing.T, gateway string) (stdout, stderr string, exitCode int) {
+// 继承环境中的 MARS_* 全部剔除，避免宿主机变量干扰断言；extraEnv 形如 KEY=VALUE，
+// 在默认值之后覆盖设置。
+func runEntrypoint(t *testing.T, gateway string, extraEnv ...string) (stdout, stderr string, exitCode int) {
 	t.Helper()
 
-	var env []string
+	envMap := map[string]string{}
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "MARS_") {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok || strings.HasPrefix(k, "MARS_") {
 			continue
 		}
-		env = append(env, kv)
+		envMap[k] = kv[len(k)+1:]
+	}
+	envMap["MARS_GATEWAY_URL"] = gateway
+	envMap["MARS_SESSION_TOKEN"] = "test-token"
+	envMap["MARS_AGENT_BIN"] = "/bin/echo"
+	for _, kv := range extraEnv {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok {
+			t.Fatalf("非法 extraEnv %q", kv)
+		}
+		envMap[k] = kv[len(k)+1:]
+	}
+	env := make([]string, 0, len(envMap))
+	for k, v := range envMap {
+		env = append(env, k+"="+v)
 	}
 
 	cmd := exec.Command("sh", "scripts/entrypoint.sh")
-	cmd.Env = append(env,
-		"MARS_GATEWAY_URL="+gateway,
-		"MARS_SESSION_TOKEN=test-token",
-		"MARS_AGENT_BIN=/bin/echo",
-	)
+	cmd.Env = env
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
