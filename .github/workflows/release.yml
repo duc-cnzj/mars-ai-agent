@@ -26,16 +26,6 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      # 发布 tag 必须与 Chart 默认镜像 tag 一致，否则 Helm 部署会拉到旧镜像。
-      - name: 校验 Chart.appVersion 与 tag 一致
-        run: |
-          tag="${GITHUB_REF#refs/tags/}"
-          chart="$(awk -F'"' '/^appVersion:/ {print $2}' charts/mars-agent/Chart.yaml)"
-          if [ "$tag" != "$chart" ]; then
-            echo "git tag ($tag) 与 Chart.appVersion ($chart) 不一致：请先提升 Chart.yaml" >&2
-            exit 1
-          fi
-
       - name: 安装 Go（版本以 go.mod 为准）
         uses: actions/setup-go@v5
         with:

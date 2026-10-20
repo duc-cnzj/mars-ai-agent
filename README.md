@@ -86,7 +86,7 @@ MARS_AGENT_BIN=/bin/echo sh scripts/entrypoint.sh ok
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| `.github/workflows/release.yml` | 打 `v*` tag | 发布门禁（gofmt → `go vet` → `go test -race` → `make agent`，校验 tag 与 `Chart.appVersion` 一致，并对 chart 跑 `helm lint` + 渲染断言），通过后构建 `linux/amd64,linux/arm64` 镜像并推送（口径与 mars 主仓一致） |
+| `.github/workflows/release.yml` | 打 `v*` tag | 发布门禁（gofmt → `go vet` → `go test -race` → `make agent`，并对 chart 跑 `helm lint` + 渲染断言），通过后构建 `linux/amd64,linux/arm64` 镜像并推送（口径与 mars 主仓一致） |
 
 > 仓库只有发布流水线，没有 PR / 分支 CI：合入前的检查请在本地跑
 > `make agent_test`，chart 改动再跑一遍下文「Helm 部署」里的 `helm lint` / `helm template`。
@@ -180,7 +180,7 @@ helm install alice ./charts/mars-agent \
 | `mars.gatewayURL` | mars 网关地址（默认 `http://mars-server.mars.svc:9000`） |
 | `mars.token` | 会话令牌（短期 scoped JWT）；为空则安装直接失败（fail fast） |
 | `image.repository` | 镜像仓库（默认 `registry.cn-hangzhou.aliyuncs.com/duc-cnzj/mars-agent`） |
-| `image.tag` | 镜像 tag（默认取 `Chart.appVersion`；`values.yaml` 中留空，发布时校验 tag 与之一致） |
+| `image.tag` | 镜像 tag（默认取 `Chart.appVersion`；`values.yaml` 中留空） |
 | `image.pullPolicy` | 拉取策略（默认 `IfNotPresent`） |
 | `imagePullSecrets` | 私有仓库拉取凭据（可选） |
 | `podAnnotations` | 追加到 Pod 的注解 |
