@@ -1,4 +1,5 @@
 {
   "$schema": "https://opencode.ai/tui.json",
-  "plugin": ["./plugins/mars-logo.tsx"]
+  "plugin": ["./plugins/mars-logo.tsx"],
+  "mouse": true
 }

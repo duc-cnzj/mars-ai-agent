@@ -52,11 +52,11 @@ func run() error {
 	if err := MaterializeTUI(cfgDir); err != nil {
 		return fmt.Errorf("落盘 TUI 配置失败: %w", err)
 	}
-	// 关闭 opencode 首页内置 tips（run --attach 等与 mars 场景无关的通用提示）。
-	// 属于装饰性优化：失败只告警，绝不阻断启动——kv.json 损坏或 opencode 升级改了
-	// 键值格式，都不应让用户失去整个沙箱终端。
-	if err := DisableTips(env.Home); err != nil {
-		log.Printf("mars-agent: 关闭 TUI tips 失败（忽略，不影响启动）: %v", err)
+	// 初始化 TUI 偏好：关闭首页通用 tips，并默认关闭 spinner 动画（57fps 空转
+	// 会吃满一个核，表现为输入/滚动卡顿）。best-effort：kv.json 损坏或 opencode
+	// 升级改了键值格式，都不应让用户失去整个沙箱终端。
+	if err := ApplyTUIPrefs(env.Home); err != nil {
+		log.Printf("mars-agent: 初始化 TUI 偏好失败（忽略，不影响启动）: %v", err)
 	}
 
 	args, err := serveArgs(env)

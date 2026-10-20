@@ -12,6 +12,12 @@ import (
 
 // tuiFS 内嵌 opencode TUI 配置与品牌插件（tui.json + plugins/mars-logo.tsx）。
 //
+// tui.json 里 mouse=true：保留 opencode 的鼠标捕获，让 TUI 自己处理拖选与滚动。
+// 这样选区由 opencode 按自身面板边界计算，不会像 xterm.js 那样把左右分屏当成
+// 同一行字符、换行时把右侧信息一起选中。复制经 OSC 52 交给浏览器终端处理，
+// 前端需注册对应的 OSC 52 handler（见 mars frontend TabShell）。
+// 仍可用 Shift+拖（macOS Option+拖）强制走终端原生选区。
+//
 //go:embed tui
 var tuiFS embed.FS
 
@@ -48,18 +54,20 @@ func MaterializeTUI(dst string) error {
 	return nil
 }
 
-// DisableTips 关闭 opencode TUI 首页的内置 tips（如「Use opencode run --attach ...」）。
+// ApplyTUIPrefs 初始化 opencode TUI 的平台级偏好：
 //
-// opencode 的 internal:home-tips 插件把开关存在 TUI 键值存储的 tips_hidden 键上
-// （对应命令面板 System → Hide tips），落盘位置按 XDG 约定为
-// $XDG_STATE_HOME/opencode/kv.json，未设置 XDG_STATE_HOME 时为
-// $HOME/.local/state/opencode/kv.json。这里在启动时统一置位，避免每个沙箱用户
-// 首次进入 TUI 都看到与 mars 场景无关的 opencode 通用提示。
+//   - 关闭首页内置 tips（tips_hidden，对应命令面板 System → Hide tips）；
+//   - 默认关闭 TUI 动画（animations_enabled，对应命令面板 Session →
+//     Disable animations）。opencode 的 spinner 约 57fps 持续重绘，即使空闲也能
+//     吃满一个核，在沙箱里表现为输入/滚动卡顿（opencode #3990 / #42657）。
+//     只在键不存在时写入 false，用户主动打开动画后不再覆盖。
 //
-// 采用读-合并-写，保留用户在 kv.json 里的其他 TUI 偏好。
+// 落盘位置按 XDG 约定为 $XDG_STATE_HOME/opencode/kv.json，未设置
+// XDG_STATE_HOME 时为 $HOME/.local/state/opencode/kv.json。采用读-合并-写，
+// 保留用户在 kv.json 里的其他 TUI 偏好。
 //
-// 调用方应把它当作 best-effort：失败只影响首页提示是否隐藏，不得阻断沙箱启动。
-func DisableTips(home string) error {
+// 调用方应把它当作 best-effort：失败只影响 TUI 偏好，不得阻断沙箱启动。
+func ApplyTUIPrefs(home string) error {
 	stateDir := filepath.Join(home, ".local", "state", "opencode")
 	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
 		stateDir = filepath.Join(xdg, "opencode")
@@ -77,10 +85,18 @@ func DisableTips(home string) error {
 		return fmt.Errorf("读取 %s 失败: %w", path, err)
 	}
 
-	if hidden, _ := kv["tips_hidden"].(bool); hidden {
+	changed := false
+	if hidden, _ := kv["tips_hidden"].(bool); !hidden {
+		kv["tips_hidden"] = true
+		changed = true
+	}
+	if _, ok := kv["animations_enabled"]; !ok {
+		kv["animations_enabled"] = false
+		changed = true
+	}
+	if !changed {
 		return nil
 	}
-	kv["tips_hidden"] = true
 
 	data, err := json.MarshalIndent(kv, "", "  ")
 	if err != nil {
