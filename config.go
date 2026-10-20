@@ -28,6 +28,15 @@ const (
 	mcpPath      = "/mcp"
 )
 
+// mcpServerName 是写入 opencode 配置的 MCP 服务名，也是工具权限键的前缀。
+// opencode 把 MCP 工具注册为 sanitize(服务名) + "_" + sanitize(工具名)。
+const mcpServerName = "mars-tools"
+
+// writeTools 是 mars MCP 的写操作工具，执行前必须人工确认。
+// 服务端用 MCP readOnlyHint 标注读写语义，但钉版 opencode（1.19.2）不消费该注解，
+// 未配置权限规则时一律默认 allow——所以这里必须显式落成 opencode 的 permission 规则。
+var writeTools = []string{"apply_project", "toggle_hibernate", "restart_pod", "exec_command"}
+
 // grayHeaderName 是 nginx-ingress canary 读取的灰度路由头；值为 always 时固定路由到灰度通道。
 const grayHeaderName = "mars_gray"
 
@@ -85,10 +94,11 @@ func LoadEnv() (Env, error) {
 
 // Config 是 opencode.json 的结构化表示，字段形态对应 opencode v1 配置规范。
 type Config struct {
-	Schema   string               `json:"$schema"`
-	Provider map[string]Provider  `json:"provider"`
-	Model    string               `json:"model"`
-	MCP      map[string]MCPServer `json:"mcp"`
+	Schema     string               `json:"$schema"`
+	Provider   map[string]Provider  `json:"provider"`
+	Model      string               `json:"model"`
+	MCP        map[string]MCPServer `json:"mcp"`
+	Permission map[string]string    `json:"permission"`
 }
 
 // Provider 描述一个 LLM 供应商（此处恒为指向 mars 代理的 mars 供应商）。
@@ -146,13 +156,27 @@ func BuildConfig(env Env) Config {
 		},
 		Model: providerID + "/" + env.Model,
 		MCP: map[string]MCPServer{
-			"mars-tools": {
+			mcpServerName: {
 				Type:    "remote",
 				URL:     mcpServerURL(env),
 				Headers: mcpHeaders(env.Gray),
 			},
 		},
+		Permission: writeToolPermissions(),
 	}
+}
+
+// writeToolPermissions 把 mars MCP 的写工具显式配置成 opencode 的 ask 权限：
+// 每次调用都会在客户端弹人工确认，拒绝时工具不会执行。
+//
+// 键名必须与 opencode 的 MCP 工具注册名一致（sanitize(服务名)+"_"+sanitize(工具名)）。
+// 不要改用通配符兜底——permission 规则的合并顺序不保证，精确键最稳。
+func writeToolPermissions() map[string]string {
+	perms := make(map[string]string, len(writeTools))
+	for _, tool := range writeTools {
+		perms[mcpServerName+"_"+tool] = "ask"
+	}
+	return perms
 }
 
 // llmBaseURL 返回 LLM provider 的 baseURL：MARS_LLM_BASE_URL 有值即整体覆盖

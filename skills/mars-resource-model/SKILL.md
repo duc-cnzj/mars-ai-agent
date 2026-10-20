@@ -27,14 +27,24 @@ mars 是一个面向 Kubernetes 的应用管理平台，资源层级自上而下
 | `list_namespaces` | `page` / `page_size` / `name`（模糊：空间名或空间内项目名） | `{items, count, page, page_size}`；items 内嵌该空间的项目概要（不含 config） |
 | `get_current_user` | 无参数 | `{id, email, name, roles, is_admin, is_super_admin}`；返回令牌绑定的身份（沙箱内恒为项目创建者，不是当前操作者） |
 | `list_projects` | `namespace`（必填）+ `name`（模糊） | `{projects, total, page, page_size}`；项目 `id` 供后续工具使用 |
-| `get_project` | `project_id` | 完整项目模型（直接回吐，未包裹） |
+| `get_project` | `project_id` | 完整项目模型（直接回吐，未包裹）；含 `hibernate_enabled` / `hibernate_state` / `hibernate_window_names` |
+| `list_hibernate_windows` | 无参数 | `{items:[{id,name,start,end,description,repo_names}]}`；`start`/`end` 为 HH:MM，`start>end` 表示跨零点 |
 | `list_project_containers` | `project_id` | `{items:[{namespace,pod,container,is_old,terminating,pending,ready}]}` |
+| `check_apply_status` | `project_id` | `{status, reason, containers, failures}`；status 数字枚举同 `get_project`；failures 失败时含 kind/workload/pod/container、reason、message、logs（CrashLoopBackOff 时是**上一次崩溃**的日志） |
+| `get_project_endpoints` | `project_id` | `{urls:[{name,url,type,svc_name,ingress_name}], cpu, memory}`；没有暴露入口时 `urls` 为空数组（不是错误） |
+| `get_project_resource_tree` | `project_id` | `{status, nodes:[{id,kind,name,namespace,status,labels,old}], edges:[{id,type,source,target}]}`；kind/edge type 见工具描述 |
 | `check_pod_status` | `namespace` + `pod` | `{running, reason}` |
 | `list_namespace_events` | `namespace` | `{events:[{type,reason,note,object,count,last_seen,container}]}` |
+| `list_operation_events` | `page` / `page_size` / `search` / `all`（`all` 仅管理员生效） | `{page,page_size,items:[{id,action,username,message,old,new,has_diff,event_at,...}]}`；普通用户只能看到自己的事件 |
 | `get_container_logs` | `namespace` + `pod` + `container`（多容器必填）+ `show_events` + `tail_lines`（默认 1000） | `{namespace,pod_name,container_name,log}` |
 | `get_pod_metrics` | `namespace` + `pod` | `{cpu, memory, humanize_cpu, humanize_memory, time, length}` |
 | `list_project_changelogs` | `project_id` + `limit` + `only_changed` | `{items:[...]}` |
+| `list_git_branches` | `project_id` + `include_all`（默认只返回可部署分支白名单） | `{items:[{value,label,type,branch,git_project_id}]}`；`value` 即 `apply_project.git_branch` |
+| `list_git_commits` | `project_id` + `branch` + `limit`（缺省 20、上限 100） | 同上结构；`value` 是完整 commit SHA |
+| `get_commit_detail` | `project_id` + `branch` + `commit`（完整 SHA） | `{id,short_id,title,author_*,committer_*,web_url,message,committed_date,...}` |
+| `get_pipeline_status` | `project_id` + `branch` + `commit`（完整 SHA） | `{status, web_url, jobs:[{name,status,stage_name}]}`；status=success\|failed\|running\|manual\|unknown |
 | `apply_project`（写） | `namespace` + `name` 定位项目；`config` / `extra_values` / `git_*` / `dry_run` | `{yaml_files, project, dry_run}`；dry_run 时 project 为空 |
+| `toggle_hibernate`（写） | `project_id` + `enabled` + `window_names`（启用时至少一个、须属仓库允许集合） | `{enabled, state, window_names}`；**只改开关，不触发重部署** |
 | `restart_pod`（写） | `namespace` + `pod` | `{deleted, namespace, pod, message}` |
 | `exec_command`（写） | `namespace` + `pod` + `container`（可选） + `command` + `timeout_seconds` | `{output, exit_code?, truncated, timed_out, start_failed, error?}` |
 
@@ -49,8 +59,9 @@ mars 是一个面向 Kubernetes 的应用管理平台，资源层级自上而下
    **唯一例外**：`list_projects` 的 `deploy_status` 是字符串（`StatusDeployed` 等）。
 3. **数量单位**：`get_pod_metrics.cpu` 是毫核（250 = 0.25 核）；`memory` 是 KB（1000 字节，已取整）；
    需要展示时优先用 `humanize_cpu` / `humanize_memory`。
-4. **成功 ≠ 完成**：`apply_project` 与 `restart_pod` 都是异步生效——返回成功只代表请求被接受，
-   要再用 `list_project_containers` / `check_pod_status` / `get_container_logs` 确认结果。
+4. **成功 ≠ 完成**：`apply_project` 与 `restart_pod` 都是异步生效——返回成功只代表请求被接受。
+   部署/重启后**优先**用 `check_apply_status`（一次拿到 status、reason 与失败容器清单）确认结果，
+   需要看具体 Pod 或完整日志时再用 `list_project_containers` / `check_pod_status` / `get_container_logs`。
    任何工具失败都会以 `isError=true` 回吐原因（NotFound / PermissionDenied / 参数校验失败等）。
 
 ## 配置模型（改配置前必读）
@@ -77,10 +88,12 @@ final_extra_values → 再 `apply_project` 只传要改的字段（config 是整
 
 1. `list_project_changelogs`（`project_id`，最新在前）找到故障前最后一个正常版本；
 2. 该记录的 `config` 与 `final_extra_values` 就是当时的配置状态；
-3. `apply_project` 传 `config`（整段替换）+ `extra_values`（按 path 覆盖，未列出的沿用现状），
+3. 需要回退代码版本时：用 `list_git_branches` 确认分支可部署 → `list_git_commits` 取目标提交的
+   完整 SHA → `get_commit_detail` 核对提交内容 → `get_pipeline_status` 确认该提交 CI 已通过；
+4. `apply_project` 传 `config`（整段替换）+ `extra_values`（按 path 覆盖，未列出的沿用现状），
    需要同时回退分支/提交时再传 `git_branch` / `git_commit`；
-4. 正式部署前先 `dry_run=true` 核对渲染结果，部署后用 `list_project_containers` /
-   `check_pod_status` 确认。
+5. 正式部署前先 `dry_run=true` 核对渲染结果，部署后用 `check_apply_status` 确认
+   （需要看具体 Pod 时再补 `list_project_containers` / `check_pod_status`）。
 
 注意：变更记录里的 `config` 是**当次配置片段**，不是完整 helm values；`date` 是中文相对时间，
 解析时间用 `created_at`（RFC3339）。`config` / `git_branch` 无法通过工具清空（需到 mars 界面操作）。
@@ -109,5 +122,8 @@ final_extra_values → 再 `apply_project` 只传要改的字段（config 是整
 ## 工具使用约定
 
 - 先用列取类工具（`list_namespaces` / `list_projects` / `list_project_containers`）确定对象，再执行动作类工具。
-- 动作类工具（`apply_project` / `restart_pod` / `exec_command`）会真正改动环境，需要用户在客户端确认后才会执行——
-  调用前先向用户说明"将要做什么、影响哪个环境"，且不要假设已成功（以工具返回为准）。
+- 动作类工具（`apply_project` / `toggle_hibernate` / `restart_pod` / `exec_command`）会真正改动环境，
+  需要用户在客户端确认后才会执行——调用前先向用户说明"将要做什么、影响哪个环境"，且不要假设已成功（以工具返回为准）。
+  `toggle_hibernate` 只切开关、不触发重部署；`restart_pod` 是立即删除、重建异步。
+- 判断「入口通不通 / Service 有没有挂到工作负载 / 是否残留旧副本」用 `get_project_resource_tree`；
+  需要访问地址与项目总用量用 `get_project_endpoints`；追查「谁改过配置」用 `list_operation_events`。

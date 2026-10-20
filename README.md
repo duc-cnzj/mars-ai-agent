@@ -237,6 +237,8 @@ helm template smoke charts/mars-agent --set mars.token=demo-token
 ## 与 opencode 版本强耦合的点（升级时必查）
 
 - `config.go` 的配置字段形态：v1 用 `provider` / `npm` / `options`，v2 用 `providers` / `package` / `settings`。
+- `config.go` 的 `permission` 规则键：opencode 把 MCP 工具注册为 `sanitize(服务名)_sanitize(工具名)`
+  （当前为 `mars-tools_<tool>`）；且**不消费** MCP 的 `readOnlyHint`，写工具未显式配 `ask` 时会默认 allow。
 - `main.go` 的 `opencode serve` 参数名（`--hostname` / `--port`）。
 - Skills 的发现路径（`$HOME/.config/opencode/skills/`）。
 - `tui/plugins/mars-logo.tsx` 使用的 `home_logo` 插槽与 TUI 插件 API（TUI 配置为 `tui.json`）。

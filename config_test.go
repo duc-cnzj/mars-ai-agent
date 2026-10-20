@@ -131,6 +131,17 @@ func TestBuildConfig(t *testing.T) {
 		t.Errorf("mcp Authorization = %q", mcp.Headers["Authorization"])
 	}
 
+	// 写工具必须显式 ask：钉版 opencode 不消费 MCP readOnlyHint，未配置规则时默认 allow。
+	for _, tool := range writeTools {
+		key := mcpServerName + "_" + tool
+		if got := cfg.Permission[key]; got != "ask" {
+			t.Errorf("permission[%q] = %q, want ask", key, got)
+		}
+	}
+	if len(cfg.Permission) != len(writeTools) {
+		t.Errorf("permission 规则数 = %d, want %d（只配写工具）", len(cfg.Permission), len(writeTools))
+	}
+
 	// 序列化产物绝不应包含令牌明文。
 	data, err := json.Marshal(cfg)
 	if err != nil {
