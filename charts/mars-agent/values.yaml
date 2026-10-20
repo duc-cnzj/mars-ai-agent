@@ -16,8 +16,8 @@ mars:
 image:
   repository: registry.cn-hangzhou.aliyuncs.com/duc-cnzj/mars-agent
   # 镜像 tag（留空则取 Chart.appVersion）。
-  tag: ""
-  pullPolicy: IfNotPresent
+  tag: "latest"
+  pullPolicy: Always
 
 # 私有镜像仓库拉取凭据（可选）。
 imagePullSecrets: []
