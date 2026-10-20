@@ -1,0 +1,11 @@
+# 构建上下文瘦身：镜像只需要 Go 源码 + 内嵌资源 + 预置的 opencode 二进制。
+# 注意：绝不能忽略 vendor/——Dockerfile 要从中 COPY opencode。
+.git
+.github
+.idea
+bin
+# 不参与镜像构建的仓库内容。
+charts
+Makefile
+# 下载中断时可能残留的压缩包（Makefile 正常路径会删掉）。
+vendor/opencode/*.tar.gz

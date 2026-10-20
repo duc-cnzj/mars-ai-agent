@@ -1,0 +1,23 @@
+mars-agent 已部署到命名空间 {{ .Release.Namespace }}。
+
+检查启动状态：
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "mars-agent.fullname" . }}
+
+本 chart 不创建 Service，集群内访问请用端口转发：
+  kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "mars-agent.fullname" . }} {{ include "mars-agent.containerPort" . }}:{{ include "mars-agent.containerPort" . }}
+
+进入容器（镜像自带 bash）：
+  kubectl -n {{ .Release.Namespace }} exec -it deploy/{{ include "mars-agent.fullname" . }} -- bash
+
+端点约定：
+  /         opencode Web UI
+  /doc      OpenAPI 文档
+  /health   健康检查（探针使用）
+
+运行时配置：
+  agent 启动时经 GET {{ .Values.mars.gatewayURL }}/api/ai/config 拉取模型等参数，
+  chart 只下发网关地址与令牌；模型在 mars 的 ai.model 配置项维护。
+
+安全提醒：
+  - MARS_SESSION_TOKEN 是短期 scoped JWT，由 mars 注入；不要写进 values.yaml 或提交到 git。
+  - 当前由 chart 按 mars.token 创建 Secret 并以 secretKeyRef 注入容器，令牌不落进 Deployment 明文。

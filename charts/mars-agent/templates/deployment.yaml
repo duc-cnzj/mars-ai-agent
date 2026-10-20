@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mars-agent.fullname" . }}
+  labels:
+    {{- include "mars-agent.labels" . | nindent 4 }}
+spec:
+  # 每个沙箱固定单副本（每个用户独占一个沙箱）。
+  replicas: 1
+  # 单用户独占沙箱：Recreate 避免滚动更新时新旧两个 agent 同时对外服务。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "mars-agent.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # 令牌变化时触发滚动。
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "mars-agent.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "mars-agent.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        # 非 root（uid 65532，与镜像内用户一致）+ RuntimeDefault seccomp。
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ include "mars-agent.containerPort" . }}
+              protocol: TCP
+          env:
+            # 模型等运行时参数由镜像入口脚本经该地址拉取（GET <gateway>/api/ai/config），
+            # chart 不再逐个下发。
+            - name: MARS_GATEWAY_URL
+              value: {{ required "缺少 mars.gatewayURL（mars 网关地址）" .Values.mars.gatewayURL | quote }}
+            # 由固定端口拼出，保证与探针使用同一端口。
+            - name: MARS_LISTEN_ADDR
+              value: {{ printf "0.0.0.0:%s" (include "mars-agent.containerPort" .) | quote }}
+            - name: MARS_SESSION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mars-agent.fullname" . }}
+                  key: mars-session-token
+          securityContext:
+            # 根文件系统只读：agent 的可写面被收敛到 /workspace（配置/skills）与 /tmp。
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+          # 探针直达 opencode serve 的 /health（wrapper exec 后进程即 opencode）。
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 2
+            # 2s × 60 = 120s 冷启动窗口；超时才判定容器起不来。
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        # /workspace 是 HOME：opencode 配置、只读 skills 与会话数据（~/.local/share/opencode）都落在这里。
+        # 不设 sizeLimit：会话数据随使用增长，限额只会换来 emptyDir 超限后的 Pod 驱逐。
+        - name: workspace
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

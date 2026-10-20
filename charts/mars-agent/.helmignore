@@ -1,0 +1,8 @@
+# helm package 时排除的本地文件。
+.DS_Store
+.git/
+.gitignore
+.idea/
+*.tgz
+*.swp
+*.bak

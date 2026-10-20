@@ -1,0 +1,35 @@
+# mars-agent 沙箱部署参数。
+#
+# ⚠️ 本文件会被 mars 当模板渲染：注释与取值中禁止出现尖括号包裹的文本，
+#    否则报错 `function "xxx" not defined`。
+#
+# 一个 release = 一个 Deployment（不创建 Service）。必填仅 mars.gatewayURL 与
+# mars.token；模型等运行时参数由 agent 启动时经 GET /api/ai/config 拉取。
+
+# mars 网关注入的运行时契约。
+mars:
+  # mars 网关地址（MCP + LLM 代理 + 运行时配置接口）。
+  gatewayURL: "http://mars-server.mars.svc:9000"
+  # 短期 scoped JWT；为空则安装直接失败。经 Secret 注入，不落 Deployment 明文。
+  token: ""
+
+image:
+  repository: registry.cn-hangzhou.aliyuncs.com/duc-cnzj/mars-agent
+  # 镜像 tag（留空则取 Chart.appVersion）。
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# 私有镜像仓库拉取凭据（可选）。
+imagePullSecrets: []
+
+# 追加到 Pod 的注解。
+podAnnotations: {}
+
+# 常驻 opencode 约 300MiB，叠加 TUI 峰值约 1.1GiB：1Gi 会被 OOM kill，建议 2Gi。
+resources: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

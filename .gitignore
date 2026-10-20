@@ -1,0 +1,6 @@
+# 预置的 opencode 二进制：体积大且需按版本/校验和自行获取，不入库（见 README.md）
+vendor/
+# 构建产物
+/bin/
+# IDE 本地配置
+/.idea/
