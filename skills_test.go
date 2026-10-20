@@ -83,6 +83,66 @@ func TestMaterializeSkillsRepeated(t *testing.T) {
 	}
 }
 
+// TestEmbeddedSkillsFrontmatter 校验每个内嵌 skill 的 frontmatter：name 与目录名一致、
+// description 非空。opencode 通过两者发现并选择 skill，写错会被静默忽略。
+func TestEmbeddedSkillsFrontmatter(t *testing.T) {
+	var count int
+	err := fs.WalkDir(skillsFS, skillsRoot, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || d.Name() != "SKILL.md" {
+			return nil
+		}
+		count++
+
+		content, err := skillsFS.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		meta := parseFrontmatter(t, p, string(content))
+		if want := filepath.Base(filepath.Dir(p)); meta["name"] != want {
+			t.Errorf("%s: frontmatter name = %q, want %q（必须与目录名一致）", p, meta["name"], want)
+		}
+		if strings.TrimSpace(meta["description"]) == "" {
+			t.Errorf("%s: frontmatter description 为空", p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("遍历内嵌 skills 失败: %v", err)
+	}
+	if count == 0 {
+		t.Fatal("未找到任何 SKILL.md")
+	}
+}
+
+// parseFrontmatter 提取 SKILL.md 开头 --- 区块中的顶层键值（本仓只依赖 name/description）。
+func parseFrontmatter(t *testing.T, path, content string) map[string]string {
+	t.Helper()
+	const fence = "---\n"
+	if !strings.HasPrefix(content, fence) {
+		t.Fatalf("%s: 缺少 frontmatter 起始分隔符", path)
+	}
+	rest := content[len(fence):]
+	end := strings.Index(rest, "\n---")
+	if end < 0 {
+		t.Fatalf("%s: 缺少 frontmatter 结束分隔符", path)
+	}
+	meta := map[string]string{}
+	for _, line := range strings.Split(rest[:end], "\n") {
+		if strings.HasPrefix(line, " ") {
+			continue
+		}
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		meta[strings.TrimSpace(key)] = strings.TrimSpace(val)
+	}
+	return meta
+}
+
 // chmodTreeWritable 递归恢复目录/文件的写权限，供测试清理只读树时使用。
 func chmodTreeWritable(root string) {
 	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {

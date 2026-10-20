@@ -7,6 +7,13 @@ description: CrashLoopBackOff（Pod 反复重启）的标准排查步骤——�
 
 按由外到内的顺序收敛，每一步都先拿证据再下结论。
 
+## 沙箱能力边界（先对齐，少走弯路）
+
+- 沙箱内**没有 kubectl / helm，也没有集群凭证**：不要尝试用 shell 直连 Kubernetes API，
+  所有集群操作只能经 MCP 工具（工具清单以 MCP 实时暴露为准）。
+- `exec_command` 只能进入**已运行**的容器；Pod 处于 Pending / ImagePullBackOff 时无容器可执行。
+- 只能看到令牌创建者有权访问的命名空间，越权请求会被服务端以 PermissionDenied 拒绝。
+
 ## 第 1 步：确认状态
 
 调用 `check_pod_status`（入参 namespace + pod）。
@@ -20,8 +27,16 @@ description: CrashLoopBackOff（Pod 反复重启）的标准排查步骤——�
 按 reason 分流：
 
 - `CrashLoopBackOff` / `BackOff` → 继续第 2、3 步。
-- `ImagePullBackOff` / `ErrImagePull` → 镜像拉取问题，转镜像仓库/凭据排查。
-- `Pending` → 调度或资源问题（节点资源、亲和性、PVC 未就绪），重点看第 2 步的 `FailedScheduling` / `FailedMount`。
+- `ImagePullBackOff` / `ErrImagePull` → 看第 2 步事件里 `Failed` 的 `note`：区分认证失败、
+  镜像 / tag 不存在、仓库不可达。容器尚未创建，不能拉日志或 exec；镜像 tag 属项目配置、
+  仓库凭据由管理员维护，先用 `get_project` 核对镜像相关配置，不要尝试在容器内排查。
+- `Pending` → 看第 2 步事件：`FailedScheduling` 看资源不足 / 节点亲和 / 污点，`FailedMount`
+  看 PVC / Secret 缺失。Pod 未运行不能 exec；需要事件文本时用 `get_container_logs` +
+  `show_events=true`（Pending 下返回的是事件，不是容器日志）。
+- 与 `OOMKilled` 相关的重复重启 → 见第 2 步 `OOMKilling`。指标是**实时采样**，OOM 重启后
+  读数可能很低，不能据此排除内存问题。
+- `Unhealthy` → 探针失败：对照启动日志与探针的路径 / 端口，判断是启动慢、路径写错还是
+  依赖不可用。
 
 ## 第 2 步：看事件
 

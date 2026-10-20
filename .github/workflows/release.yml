@@ -57,6 +57,35 @@ jobs:
       - name: 单元测试（-race -count=1）
         run: go test ./... -race -count=1
 
+      - name: 安装 Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      # chart 没有独立 CI，发布前必须渲染一遍：防止 Service 被加回、副本数漂移、
+      # 镜像仓库写错，或把模型错误地固化进 manifest。
+      - name: Helm 门禁（lint + 渲染断言）
+        run: |
+          helm lint charts/mars-agent --set mars.token=demo-token
+          out="$(helm template smoke charts/mars-agent --set mars.token=demo-token)"
+          if grep -q '^kind: Service$' <<<"$out"; then
+            echo "渲染出了 Service：沙箱不经反向代理，不应创建" >&2
+            exit 1
+          fi
+          if ! grep -q 'replicas: 1' <<<"$out"; then
+            echo "副本数不是 1" >&2
+            exit 1
+          fi
+          if ! grep -q 'image: "registry.cn-hangzhou.aliyuncs.com/duc-cnzj/mars-agent:' <<<"$out"; then
+            echo "镜像仓库不是 chart 默认值" >&2
+            exit 1
+          fi
+          if grep -q 'name: MARS_MODEL' <<<"$out"; then
+            echo "chart 不应注入 MARS_MODEL（模型由入口脚本从 mars 拉取）" >&2
+            exit 1
+          fi
+          echo "helm 门禁通过"
+
       - name: 构建 wrapper
         run: make agent
 
@@ -88,9 +117,12 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Login registries
+        env:
+          ALIYUN_DOCKER_PASSWORD: ${{ secrets.ALIYUN_DOCKER_PASSWORD }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
         run: |
-          docker login registry.cn-hangzhou.aliyuncs.com -u ${{ secrets.ALIYUN_DOCKER_USERNAME }} --password ${{ secrets.ALIYUN_DOCKER_PASSWORD }}
-          docker login -u ${{ secrets.DOCKER_USERNAME }} --password ${{ secrets.DOCKER_PASSWORD }}
+          echo "$ALIYUN_DOCKER_PASSWORD" | docker login registry.cn-hangzhou.aliyuncs.com -u ${{ secrets.ALIYUN_DOCKER_USERNAME }} --password-stdin
+          echo "$DOCKER_PASSWORD" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       # 双架构镜像需要两份钉版 opencode；Makefile 会逐个校验 sha256，校验不过即失败。
       - name: 预置钉版 opencode（amd64 + arm64，含 sha256 校验）

@@ -14,6 +14,16 @@ agent: | $(BIN_DIR)
 agent_test:
 	go test ./... -race -count=1
 
+# agent_check 本地门禁：gofmt + go vet + 全量测试，口径与 release 的 test job 对齐。
+.PHONY: agent_check
+agent_check:
+	@unformatted="$$(gofmt -l .)"; \
+	if [ -n "$$unformatted" ]; then \
+	  echo "以下文件未通过 gofmt，请执行 gofmt -w："; echo "$$unformatted"; exit 1; \
+	fi
+	go vet ./...
+	go test ./... -race -count=1
+
 # 钉版 opencode（镜像的 agent 内核）。版本与 sha256 均取自 GitHub release API 的权威 digest，
 # 一一对应；只钉版本不校验和等于没钉。升级版本时两个 digest 必须同步更新。
 OPENCODE_VERSION      ?= 1.19.2

@@ -62,6 +62,7 @@ Authorization: Bearer <MARS_SESSION_TOKEN>
 ```bash
 make agent          # 产出 bin/mars-agent
 make agent_test     # go test ./... -race
+make agent_check    # 本地门禁：gofmt + go vet + 全量测试（与 release 的 test job 对齐）
 ```
 
 冒烟（用替身避免真拉起 opencode）：
@@ -85,7 +86,7 @@ MARS_AGENT_BIN=/bin/echo sh scripts/entrypoint.sh ok
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| `.github/workflows/release.yml` | 打 `v*` tag | 发布门禁（gofmt → `go vet` → `go test -race` → `make agent`，并校验 tag 与 `Chart.appVersion` 一致），通过后构建 `linux/amd64,linux/arm64` 镜像并推送（口径与 mars 主仓一致） |
+| `.github/workflows/release.yml` | 打 `v*` tag | 发布门禁（gofmt → `go vet` → `go test -race` → `make agent`，校验 tag 与 `Chart.appVersion` 一致，并对 chart 跑 `helm lint` + 渲染断言），通过后构建 `linux/amd64,linux/arm64` 镜像并推送（口径与 mars 主仓一致） |
 
 > 仓库只有发布流水线，没有 PR / 分支 CI：合入前的检查请在本地跑
 > `make agent_test`，chart 改动再跑一遍下文「Helm 部署」里的 `helm lint` / `helm template`。
@@ -224,8 +225,10 @@ helm template smoke charts/mars-agent --set mars.token=demo-token
 - `tui/plugins/mars-logo.tsx` 使用的 `home_logo` 插槽与 TUI 插件 API（TUI 配置为 `tui.json`）。
 - `tui.go` 的 `DisableTips` 依赖 TUI 键值存储路径（`$XDG_STATE_HOME/opencode/kv.json`，
   默认 `$HOME/.local/state/opencode/kv.json`）与内置 tips 的开关键 `tips_hidden`。
+- chart 的 startup / readiness / liveness 探针都打 opencode 的 `/health`（`deployment.yaml`），
+  路径变化会让 Pod 永远不就绪。
 
-五者都已在代码内集中标注，升级只需改动对应单点。
+六者都已在代码内集中标注，升级只需改动对应单点。
 
 ## 安全设计要点
 

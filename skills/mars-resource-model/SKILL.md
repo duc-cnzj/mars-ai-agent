@@ -1,6 +1,6 @@
 ---
 name: mars-resource-model
-description: 解释 mars 平台的资源模型——命名空间(Namespace)、项目(Project)、Pod、容器(Container)之间的从属关系，以及用户口中的"项目""容器"分别对应哪个对象；并给出 13 个 MCP 工具的入参寻址方式与返回值语义。当需要把用户的自然语言指代落到具体对象、不确定某个操作用哪个工具或如何解读返回值时使用。
+description: 解释 mars 平台的资源模型——命名空间(Namespace)、项目(Project)、Pod、容器(Container)之间的从属关系，以及用户口中的"项目""容器"分别对应哪个对象；并给出 MCP 工具的入参寻址方式与返回值语义（工具清单以 MCP 实时暴露为准）。当需要把用户的自然语言指代落到具体对象、不确定某个操作用哪个工具或如何解读返回值时使用。
 ---
 
 # mars 资源模型
@@ -72,6 +72,18 @@ helm 的 values.yaml 本身是**仓库级**的、由管理员在后台维护，�
 `apply_project.extra_values` 的键。改配置的正确顺序是：先 `get_project` 读出 config 与
 final_extra_values → 再 `apply_project` 只传要改的字段（config 是整段替换，extra_values 是
 按键覆盖）→ 正式部署前可先 `dry_run=true` 预览。
+
+## 回滚（用变更记录还原配置）
+
+1. `list_project_changelogs`（`project_id`，最新在前）找到故障前最后一个正常版本；
+2. 该记录的 `config` 与 `final_extra_values` 就是当时的配置状态；
+3. `apply_project` 传 `config`（整段替换）+ `extra_values`（按 path 覆盖，未列出的沿用现状），
+   需要同时回退分支/提交时再传 `git_branch` / `git_commit`；
+4. 正式部署前先 `dry_run=true` 核对渲染结果，部署后用 `list_project_containers` /
+   `check_pod_status` 确认。
+
+注意：变更记录里的 `config` 是**当次配置片段**，不是完整 helm values；`date` 是中文相对时间，
+解析时间用 `created_at`（RFC3339）。`config` / `git_branch` 无法通过工具清空（需到 mars 界面操作）。
 
 ## 汇报约定（必须带 ID）
 
