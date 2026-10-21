@@ -62,7 +62,7 @@ LLM 供应商的 `options.headers` 与 MCP 服务的 `headers` 各带一份 `mar
 .
 ├── scripts/                        镜像内 shell 脚本
 │   ├── entrypoint.sh               容器入口：用 gatewayURL + token 拉取 mars 配置，注入环境后交给 wrapper
-│   └── mai.sh                      用户面向的稳定入口（mai → MARS_AI_BIN，默认 opencode）
+│   └── mai.sh                      用户面向的稳定入口（mai → MARS_AI_BIN，默认 opencode；attach 前自愈 MCP 连接）
 ├── main.go                         入口：校验 → 落配置/skills → exec 底层 agent serve
 ├── config.go                       生成 opencode.json（LLM/MCP 指向 mars）
 ├── skills.go                       //go:embed skills + 只读落盘
