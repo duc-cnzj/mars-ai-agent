@@ -16,26 +16,66 @@ bin="${MARS_AI_BIN:-/usr/local/bin/opencode}"
 # 再起一个 server。实测同一台机器上空闲状态：
 #   直接启动 TUI ≈ 1.1 GiB RSS / ~5% CPU；attach 客户端 ≈ 380 MiB RSS / ~1% CPU。
 # 沙箱内存通常 2 GiB，双份 server 叠加会把进程压进换页，表现为输入/滚动卡顿。
-# 只在无参数、底层是 opencode、且常驻 server 可达时启用；其余情况（mai run、
-# 换成其他内核、本地调试没有 serve）原样启动，行为不变。
-if [ "$#" -eq 0 ] && [ "$(basename "$bin")" = "opencode" ]; then
+# 只在底层是 opencode 时启用复用；换其他内核时命令与参数原样透传。
+if [ "$(basename "$bin")" = "opencode" ]; then
   addr="${MARS_LISTEN_ADDR:-0.0.0.0:4096}"
   # 监听地址可能是 0.0.0.0/[::]，容器内访问统一走回环。
   url="http://127.0.0.1:${addr##*:}"
-  if curl -sS -o /dev/null --max-time 1 "${url}/health" 2>/dev/null; then
-    # 进入 TUI 前确保 MCP 已就绪：connect API 只发起连接、不等待完成，
-    # 发一次请求就 attach 会让 TUI 在 MCP 未就绪时启动（详见 mcp-wait.sh）。
-    # 这里是最后一道兜底，覆盖 entrypoint 预热失败、非 /workspace 目录、
-    # 常驻 server 重启等情况；等待上限可用 MARS_MCP_WAIT_TIMEOUT 调整
-    # （秒，0 表示不等待）。超时只告警、不阻断：mars 网关整体故障时，
-    # 用户仍应能进入 TUI 写代码。
-    mcp_wait="${MARS_MCP_WAIT_TIMEOUT:-15}"
-    mcp_wait_bin="${MARS_MCP_WAIT_BIN:-/usr/local/bin/mars-mcp-wait}"
-    if [ -x "$mcp_wait_bin" ] && [ "$mcp_wait" -gt 0 ] 2>/dev/null; then
-      "$mcp_wait_bin" --dir "$PWD" --timeout "$mcp_wait" || true
+
+  # 健康探测加短重试：server 活着但忙时，单次 1s 超时会把它误判为不可达，
+  # 进而回退完整 TUI、起第二份 server。3 次 × 1s，最坏约 5s。
+  server_ready() {
+    i=1
+    while [ "$i" -le 3 ]; do
+      # -f：HTTP 非 2xx 也算失败，避免 /health 返回 500 时被误判为就绪。
+      if curl -sfS -o /dev/null --max-time 1 "${url}/health" 2>/dev/null; then
+        return 0
+      fi
+      if [ "$i" -lt 3 ]; then
+        sleep 1
+      fi
+      i=$((i + 1))
+    done
+    return 1
+  }
+
+  if [ "$#" -eq 0 ]; then
+    if server_ready; then
+      # 进入 TUI 前确保 MCP 已就绪：connect API 只发起连接、不等待完成，
+      # 发一次请求就 attach 会让 TUI 在 MCP 未就绪时启动（详见 mcp-wait.sh）。
+      # 这里是最后一道兜底，覆盖 entrypoint 预热失败、非 /workspace 目录、
+      # 常驻 server 重启等情况；等待上限可用 MARS_MCP_WAIT_TIMEOUT 调整
+      # （秒，0 表示不等待）。超时只告警、不阻断：mars 网关整体故障时，
+      # 用户仍应能进入 TUI 写代码。
+      mcp_wait="${MARS_MCP_WAIT_TIMEOUT:-15}"
+      mcp_wait_bin="${MARS_MCP_WAIT_BIN:-/usr/local/bin/mars-mcp-wait}"
+      if [ -x "$mcp_wait_bin" ] && [ "$mcp_wait" -gt 0 ] 2>/dev/null; then
+        "$mcp_wait_bin" --dir "$PWD" --timeout "$mcp_wait" || true
+      fi
+      # --dir 保持与直接启动一致：会话以用户当前目录为项目上下文。
+      # -c 继续上次会话。attach 在钉版 opencode（1.19.2）不支持 --auto，
+      # 自动批准由 wrapper 生成的 permission allow 规则等价实现（见 config.go）。
+      exec "$bin" attach --dir "$PWD" -c "$url"
     fi
-    # --dir 保持与直接启动一致：会话以用户当前目录为项目上下文。
-    exec "$bin" attach --dir "$PWD" "$url"
+    # 常驻 server 不可达时退回完整 TUI：同样继续上次会话并自动批准，
+    # 与 attach 路径的体验保持一致。
+    exec "$bin" -c --auto
+  fi
+
+  # `mai run`：常驻 server 可达时用 --attach 复用，避免在 CLI 进程内
+  # 另起一份 server 与 MCP 连接。用户自带 --attach、文件附件或 help 时
+  # 保持原样执行（attach 模式对 -f 的目录/大文件支持不同）。
+  if [ "$1" = "run" ]; then
+    reuse=1
+    for arg in "$@"; do
+      case "$arg" in
+        --attach | --attach=* | -f | --file | --file=* | -h | --help | -v | --version) reuse=0 ;;
+      esac
+    done
+    if [ "$reuse" -eq 1 ] && server_ready; then
+      shift
+      exec "$bin" run --attach "$url" --dir "$PWD" "$@"
+    fi
   fi
 fi
 

@@ -13,8 +13,9 @@ mars「AI 容器排查助手」的**沙箱侧组件**。每个用户独占一个
 > agent 启动时经 `GET <gateway>/api/ai/config` 拿到模型，因此进入 opencode 无需任何额外参数。
 
 > LLM 循环由 opencode 自己跑，mars 服务端不重复实现 agent。用户在项目终端里通过
-> `mai` 直接使用沙箱内的 opencode TUI，mars 以 MCP 形式向它暴露受 RBAC + 人工审批
-> 约束的工具。
+> `mai` 直接使用沙箱内的 opencode TUI，mars 以 MCP 形式向它暴露受 RBAC 约束的工具。
+> 写操作在客户端自动批准（等价 `--auto`，见 `config.go` 的 permission 规则），
+> 人工确认由 agent 在对话中先行完成。
 > 本模块**不 import mars 任何代码**，与 mars 之间只经 MCP / HTTP 交互。
 
 ## 环境变量契约（由沙箱 Pod manifest 注入）
@@ -183,8 +184,8 @@ docker exec -it mars-agent bash
 进去后 wrapper 已把配置写在 `$HOME/.config/opencode/`，直接可跑（**无需任何额外准备**）：
 
 ```bash
-mai                  # 交互式 TUI
-mai run "你好"        # 非交互跑一句
+mai                  # 交互式 TUI：复用常驻 server、继续上次会话、自动批准
+mai run "你好"        # 非交互跑一句：常驻 server 可达时用 --attach 复用
 ```
 
 > `mai` 是镜像内置的稳定入口（`/usr/local/bin/mai`），底层实际执行
@@ -254,8 +255,12 @@ helm template smoke charts/mars-agent --set mars.token=demo-token
 ## 与 opencode 版本强耦合的点（升级时必查）
 
 - `config.go` 的配置字段形态：v1 用 `provider` / `npm` / `options`，v2 用 `providers` / `package` / `settings`。
+  生成的配置固定 `autoupdate: false`，阻止钉版二进制被 opencode 自更新，也关掉 TUI 的周期性升级检查。
 - `config.go` 的 `permission` 规则键：opencode 把 MCP 工具注册为 `sanitize(服务名)_sanitize(工具名)`
-  （当前为 `mars-tools_<tool>`）；且**不消费** MCP 的 `readOnlyHint`，写工具未显式配 `ask` 时会默认 allow。
+  （当前为 `mars-tools_<tool>`）；且**不消费** MCP 的 `readOnlyHint`，未配置规则时默认 allow。
+  写工具显式配 `allow` 以等价 `--auto`——attach 子命令本身不支持 `--auto`。
+- `scripts/mai.sh` 的 `attach` 参数：钉版 opencode 仅支持 `-c/--continue`，不支持 `--auto`；
+  升级若给 attach 补上 `--auto`，可改回直传并移除配置层的 allow 兜底。
 - `main.go` 的 `opencode serve` 参数名（`--hostname` / `--port`）。
 - Skills 的发现路径（`$HOME/.config/opencode/skills/`）。
 - `tui/plugins/mars-logo.tsx` 使用的 `home_logo` 插槽与 TUI 插件 API（TUI 配置为 `tui.json`）。

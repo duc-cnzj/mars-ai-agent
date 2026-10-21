@@ -100,6 +100,11 @@ func TestBuildConfig(t *testing.T) {
 	}
 	cfg := BuildConfig(env)
 
+	// 沙箱内禁止自更新：钉版二进制不能被 opencode 自己升级掉。
+	if cfg.Autoupdate {
+		t.Errorf("autoupdate = true, want false")
+	}
+
 	p, ok := cfg.Provider[providerID]
 	if !ok {
 		t.Fatalf("缺少 provider %q", providerID)
@@ -131,11 +136,11 @@ func TestBuildConfig(t *testing.T) {
 		t.Errorf("mcp Authorization = %q", mcp.Headers["Authorization"])
 	}
 
-	// 写工具必须显式 ask：钉版 opencode 不消费 MCP readOnlyHint，未配置规则时默认 allow。
+	// 写工具显式 allow：attach 不支持 --auto，用配置层等价实现自动批准。
 	for _, tool := range writeTools {
 		key := mcpServerName + "_" + tool
-		if got := cfg.Permission[key]; got != "ask" {
-			t.Errorf("permission[%q] = %q, want ask", key, got)
+		if got := cfg.Permission[key]; got != "allow" {
+			t.Errorf("permission[%q] = %q, want allow", key, got)
 		}
 	}
 	if len(cfg.Permission) != len(writeTools) {
@@ -149,6 +154,9 @@ func TestBuildConfig(t *testing.T) {
 	}
 	if strings.Contains(string(data), env.SessionToken) {
 		t.Errorf("序列化结果疑似含令牌明文: %s", data)
+	}
+	if !strings.Contains(string(data), `"autoupdate":false`) {
+		t.Errorf("序列化结果缺少 autoupdate=false: %s", data)
 	}
 }
 

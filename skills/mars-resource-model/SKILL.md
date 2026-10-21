@@ -51,7 +51,7 @@ mars 是一个面向 Kubernetes 的应用管理平台，资源层级自上而下
 - `namespace` 一律用 `list_namespaces` 返回的 `name`（界面名，免 k8s 前缀）。
 - `pod` / `container` 一律先用 `list_project_containers` 取**当前真实存在**的名字（Pod 名带随机后缀，不能拼）。
 
-## 返回值语义（最容易误读的四点）
+## 返回值语义（最容易误读的五点）
 
 1. **零值字段会直接缺失**：所有出参都是带 `omitempty` 的标准 JSON（snake_case）。
    字段不存在 = 空串 / 0 / false / 空数组，不是"未知"。例如 `ready=false` 时 `ready` 字段根本不存在。
@@ -63,6 +63,10 @@ mars 是一个面向 Kubernetes 的应用管理平台，资源层级自上而下
    部署/重启后**优先**用 `check_apply_status`（一次拿到 status、reason 与失败容器清单）确认结果，
    需要看具体 Pod 或完整日志时再用 `list_project_containers` / `check_pod_status` / `get_container_logs`。
    任何工具失败都会以 `isError=true` 回吐原因（NotFound / PermissionDenied / 参数校验失败等）。
+5. **轮询节奏**：部署后**先直接**调 `check_apply_status`，不要先 `sleep` 固定的大段时长（如 30–45s）。
+   通常 10–20s 内就能拿到结果；若 `status=1`（Deploying），按 3–5 秒间隔再次查询，
+   总上限约 20–30 秒；也可同时用 `list_project_containers` 看是否出现非 `is_old` 的新 Pod。
+   超时仍无结论就如实说明"仍在部署"，不要编造成功。
 
 ## 配置模型（改配置前必读）
 
@@ -123,7 +127,7 @@ final_extra_values → 再 `apply_project` 只传要改的字段（config 是整
 
 - 先用列取类工具（`list_namespaces` / `list_projects` / `list_project_containers`）确定对象，再执行动作类工具。
 - 动作类工具（`apply_project` / `toggle_hibernate` / `restart_pod` / `exec_command`）会真正改动环境，
-  需要用户在客户端确认后才会执行——调用前先向用户说明"将要做什么、影响哪个环境"，且不要假设已成功（以工具返回为准）。
+  客户端会自动批准执行——调用前必须先向用户说明"将要做什么、影响哪个环境"并取得明确同意，且不要假设已成功（以工具返回为准）。
   `toggle_hibernate` 只切开关、不触发重部署；`restart_pod` 是立即删除、重建异步。
 - 判断「入口通不通 / Service 有没有挂到工作负载 / 是否残留旧副本」用 `get_project_resource_tree`；
   需要访问地址与项目总用量用 `get_project_endpoints`；追查「谁改过配置」用 `list_operation_events`。
