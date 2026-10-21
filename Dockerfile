@@ -67,7 +67,9 @@ COPY vendor/opencode/opencode-linux-${TARGETARCH} /usr/local/bin/opencode
 # 用户面向的稳定入口 mai：底层 agent 由 MARS_AI_BIN 指定（默认 opencode），
 # 以后换 claude code 等内核时用户命令不变。
 COPY scripts/mai.sh /usr/local/bin/mai
-RUN chmod 0755 /usr/local/bin/mai
+# MCP 就绪等待：entrypoint 后台预热与 mai 进入 TUI 前的兜底共用同一份逻辑。
+COPY scripts/mcp-wait.sh /usr/local/bin/mars-mcp-wait
+RUN chmod 0755 /usr/local/bin/mai /usr/local/bin/mars-mcp-wait
 # mars-agent wrapper（Skills 已 //go:embed 进二进制）
 COPY --from=builder /out/mars-agent /usr/local/bin/mars-agent
 # 入口脚本：启动时用 gatewayURL + token 拉取 mars 配置（模型）注入环境，再交给 wrapper。

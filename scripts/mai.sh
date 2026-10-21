@@ -11,8 +11,6 @@
 set -eu
 
 bin="${MARS_AI_BIN:-/usr/local/bin/opencode}"
-# 与 config.go 的 mcpServerName 保持一致。
-mcp_server="mars-tools"
 
 # 交互式 TUI 默认复用常驻 server（`opencode attach`），而不是让 TUI 在进程内
 # 再起一个 server。实测同一台机器上空闲状态：
@@ -25,20 +23,16 @@ if [ "$#" -eq 0 ] && [ "$(basename "$bin")" = "opencode" ]; then
   # 监听地址可能是 0.0.0.0/[::]，容器内访问统一走回环。
   url="http://127.0.0.1:${addr##*:}"
   if curl -sS -o /dev/null --max-time 1 "${url}/health" 2>/dev/null; then
-    # MCP 自愈：opencode 只在 instance 创建时连一次 MCP，失败后状态会粘住
-    # （日志表现为 "server unavailable ... status=failed"，且不带 error），
-    # 之后即使网关恢复也不会自动重连。进入 TUI 前查一次状态，非 connected
-    # 就调 opencode 的 reconnect API 原地重连，避免用户被迫重启整个沙箱。
-    # best-effort：探测或重连失败都不阻断 TUI 启动。
-    if status="$(curl -sS -G --max-time 5 \
-        --data-urlencode "directory=$PWD" "${url}/mcp" 2>/dev/null)"; then
-      current="$(printf '%s' "$status" |
-        jq -r --arg n "$mcp_server" '.[$n].status // empty' 2>/dev/null)"
-      if [ "$current" != "connected" ]; then
-        curl -sS -o /dev/null --max-time 5 -G -X POST \
-          --data-urlencode "directory=$PWD" \
-          "${url}/mcp/${mcp_server}/connect" 2>/dev/null || true
-      fi
+    # 进入 TUI 前确保 MCP 已就绪：connect API 只发起连接、不等待完成，
+    # 发一次请求就 attach 会让 TUI 在 MCP 未就绪时启动（详见 mcp-wait.sh）。
+    # 这里是最后一道兜底，覆盖 entrypoint 预热失败、非 /workspace 目录、
+    # 常驻 server 重启等情况；等待上限可用 MARS_MCP_WAIT_TIMEOUT 调整
+    # （秒，0 表示不等待）。超时只告警、不阻断：mars 网关整体故障时，
+    # 用户仍应能进入 TUI 写代码。
+    mcp_wait="${MARS_MCP_WAIT_TIMEOUT:-15}"
+    mcp_wait_bin="${MARS_MCP_WAIT_BIN:-/usr/local/bin/mars-mcp-wait}"
+    if [ -x "$mcp_wait_bin" ] && [ "$mcp_wait" -gt 0 ] 2>/dev/null; then
+      "$mcp_wait_bin" --dir "$PWD" --timeout "$mcp_wait" || true
     fi
     # --dir 保持与直接启动一致：会话以用户当前目录为项目上下文。
     exec "$bin" attach --dir "$PWD" "$url"

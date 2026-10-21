@@ -27,6 +27,8 @@ mars「AI 容器排查助手」的**沙箱侧组件**。每个用户独占一个
 | `MARS_GRAY` | | 由入口脚本探测 | 灰度通道标记（`always`=灰度用户，空=非灰度）。非空时 LLM 与 MCP 请求都带 `mars_gray` 头；显式设置时跳过探测 |
 | `MARS_AI_BIN` | | `/usr/local/bin/opencode` | 底层 agent 二进制路径（`mai` 与服务进程共用；可替换成 claude code 等） |
 | `MARS_LISTEN_ADDR` | | `0.0.0.0:4096` | opencode serve 监听地址 |
+| `MARS_MCP_WAIT_TIMEOUT` | | `15` | `mai` 进入 TUI 前等待 MCP 就绪的上限（秒，0=不等待） |
+| `MARS_MCP_PREWARM_TIMEOUT` | | `120` | 容器启动后后台预热 MCP 的上限（秒，0=不预热） |
 | `HOME` | | `/workspace` | 配置与 skills 的落盘根（`$HOME/.config/opencode/`） |
 
 入口脚本 `scripts/entrypoint.sh` 在启动时调用 mars 配置接口补齐 `MARS_MODEL`：
@@ -56,13 +58,28 @@ LLM 供应商的 `options.headers` 与 MCP 服务的 `headers` 各带一份 `mar
 **灰度标记不进 JWT**（mars 每次读库），所以沙箱只在容器启动时感知：后台改标后，
 存量沙箱需重启（缩容后再次唤醒即可重新触发探测）才会切换通道。
 
+## MCP 就绪保证
+
+opencode 只在 instance 创建时连一次 MCP，失败后状态会粘住（`status=failed`），
+网关恢复后也不会自动重连；且 `POST /mcp/<name>/connect` 只发起连接、不等待完成。
+因此启动链路分两层保证：
+
+1. **容器启动预热**：入口脚本在 `exec` 前拉起后台 `mars-mcp-wait`，等 opencode
+   `/health` 可达后重连 MCP 并轮询到 `connected`（默认最多 120s，可重试覆盖
+   网关尚未就绪的情况）。用户打开终端时通常已就绪。
+2. **进入 TUI 前兜底**：`mai` attach 前再等待一次（默认 15s），覆盖非
+   `/workspace` 目录、常驻 server 重启、预热超时等场景。
+
+两层都是 best-effort：超时只告警、不阻断，网关整体故障时用户仍可进入终端写代码。
+
 ## 目录结构
 
 ```
 .
 ├── scripts/                        镜像内 shell 脚本
-│   ├── entrypoint.sh               容器入口：用 gatewayURL + token 拉取 mars 配置，注入环境后交给 wrapper
-│   └── mai.sh                      用户面向的稳定入口（mai → MARS_AI_BIN，默认 opencode；attach 前自愈 MCP 连接）
+│   ├── entrypoint.sh               容器入口：拉取 mars 配置、后台预热 MCP，再交给 wrapper
+│   ├── mai.sh                      用户面向的稳定入口（mai → MARS_AI_BIN，默认 opencode；attach 前等待 MCP 就绪）
+│   └── mcp-wait.sh                 MCP 就绪等待（轮询 /mcp + connect），启动预热与 TUI 兜底共用
 ├── main.go                         入口：校验 → 落配置/skills → exec 底层 agent serve
 ├── config.go                       生成 opencode.json（LLM/MCP 指向 mars）
 ├── skills.go                       //go:embed skills + 只读落盘
