@@ -69,7 +69,7 @@ LLM 供应商的 `options.headers` 与 MCP 服务的 `headers` 各带一份 `mar
 ├── skills/                         知识型 Skills（纯知识，无执行权）
 │   ├── mars-resource-model/SKILL.md
 │   └── crashloop-triage/SKILL.md
-├── tui/                            opencode TUI 定制（tui.json + 启动页 logo 插件）
+├── tui/                            opencode TUI 定制（tui.json + 启动页 logo / 能力清单插件）
 ├── Dockerfile                      镜像：钉版 opencode + wrapper + skills
 └── vendor/opencode/                预置的 opencode 二进制（git 忽略，见下）
 ```

@@ -60,15 +60,6 @@ RUN set -eux; \
 # 写 /etc/bash.bashrc 而不是 ~/.bashrc：/workspace 在 K8s 里被 emptyDir 覆盖。
 RUN printf '%s\n' 'PS1="mars-agent:\w\$ "' >> /etc/bash.bashrc
 
-# 进入交互式 shell 时打印一次 mai 使用提示。marker 导出到子 shell，
-# 避免用户每开一层子 shell 就重复刷屏（非交互 shell 不会读 /etc/bash.bashrc）。
-RUN printf '%s\n' \
-    '# mars-agent 使用提示（每个交互式会话只打印一次）。' \
-    'if [ -z "${MARS_WELCOME_SHOWN:-}" ]; then' \
-    '  export MARS_WELCOME_SHOWN=1' \
-    '  printf "\n  mars-agent 已经准备好了，配置也会自动生成好。\n\n  你可以让我：\n    · 查命名空间、项目、Pod 和容器的状态\n    · 排查反复重启、内存被打满（OOM）、镜像拉不下来、调度 / 挂载 / 探针报错\n    · 翻容器日志、集群事件和操作记录，帮你找到报错原因\n    · 看 Pod 的 CPU / 内存用量、项目访问地址和资源拓扑\n    · 查 Git 分支、提交内容，以及 CI 流水线有没有通过\n    · 查看或开关项目定时休眠（只改开关，不会重新部署）\n    · 进容器执行命令、重启 Pod、改配置并重新部署（有改动会先征求你同意）\n\n    \033[1;36m>>> 输入 mai 进入交互式对话界面 <<<\033[0m\n\n"' \
-    'fi' >> /etc/bash.bashrc
-
 WORKDIR /workspace
 
 # 按目标架构拷入对应的 glibc 版 opencode 二进制（预置在构建上下文；见 README.md）。

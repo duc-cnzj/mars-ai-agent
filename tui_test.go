@@ -41,6 +41,9 @@ func TestMaterializeTUI(t *testing.T) {
 	if !strings.Contains(string(plugin), `home_logo`) {
 		t.Errorf("插件未注册 home_logo 插槽")
 	}
+	if !strings.Contains(string(plugin), "资源总览") {
+		t.Errorf("插件缺少启动页能力清单")
+	}
 }
 
 // TestApplyTUIPrefs 验证 tips_hidden / animations_enabled 落盘，且合并时保留
