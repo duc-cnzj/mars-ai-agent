@@ -184,7 +184,7 @@ docker exec -it mars-agent bash
 进去后 wrapper 已把配置写在 `$HOME/.config/opencode/`，直接可跑（**无需任何额外准备**）：
 
 ```bash
-mai                  # 交互式 TUI：复用常驻 server、继续上次会话、自动批准
+mai                  # 交互式 TUI：复用常驻 server、有历史会话时继续、自动批准
 mai run "你好"        # 非交互跑一句：常驻 server 可达时用 --attach 复用
 ```
 
@@ -261,6 +261,10 @@ helm template smoke charts/mars-agent --set mars.token=demo-token
   写工具显式配 `allow` 以等价 `--auto`——attach 子命令本身不支持 `--auto`。
 - `scripts/mai.sh` 的 `attach` 参数：钉版 opencode 仅支持 `-c/--continue`，不支持 `--auto`；
   升级若给 attach 补上 `--auto`，可改回直传并移除配置层的 allow 兜底。
+- **`-c/--continue` 只能在有历史会话时传**：opencode 1.19.2 在无会话可继续时会把占位
+  sessionID `dummy` 作为 TUI 初始路由发给服务端，服务端按 `ses` 前缀校验失败返回 500，
+  TUI 启动页显示 `Unexpected server error. Check server logs for details.`（`mai`
+  已先探测会话列表再决定是否带 `-c`；升级 opencode 后应回归这一场景）。
 - `main.go` 的 `opencode serve` 参数名（`--hostname` / `--port`）。
 - Skills 的发现路径（`$HOME/.config/opencode/skills/`）。
 - `tui/plugins/mars-logo.tsx` 使用的 `home_logo` 插槽与 TUI 插件 API（TUI 配置为 `tui.json`）。

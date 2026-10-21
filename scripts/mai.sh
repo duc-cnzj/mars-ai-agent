@@ -39,6 +39,19 @@ if [ "$(basename "$bin")" = "opencode" ]; then
     return 1
   }
 
+  # 是否已有可继续的历史会话。opencode 1.19.2 的 --continue 在「无会话可继续」时
+  # 会把占位 sessionID "dummy" 当作 TUI 初始路由直接发给服务端，服务端按 ses
+  # 前缀校验失败返回 500，启动页就是 "Unexpected server error. Check server logs
+  # for details."。因此先探测：没有会话就不带 -c，首次进沙箱不再必现报错。
+  # 注意 jq -e 对「零输入」返回 0，必须先判空，否则探测失败会被当成有会话。
+  has_session_via_server() {
+    body="$(curl -sfS -G --max-time 2 --data-urlencode "directory=$PWD" \
+      --data-urlencode "limit=1" "${url}/session" 2>/dev/null)" || return 1
+    [ -n "$body" ] || return 1
+    printf '%s' "$body" |
+      jq -e 'type == "array" and length > 0' >/dev/null 2>&1
+  }
+
   if [ "$#" -eq 0 ]; then
     if server_ready; then
       # 进入 TUI 前确保 MCP 已就绪：connect API 只发起连接、不等待完成，
@@ -53,13 +66,24 @@ if [ "$(basename "$bin")" = "opencode" ]; then
         "$mcp_wait_bin" --dir "$PWD" --timeout "$mcp_wait" || true
       fi
       # --dir 保持与直接启动一致：会话以用户当前目录为项目上下文。
-      # -c 继续上次会话。attach 在钉版 opencode（1.19.2）不支持 --auto，
+      # 有历史会话才 -c 继续；attach 在钉版 opencode（1.19.2）不支持 --auto，
       # 自动批准由 wrapper 生成的 permission allow 规则等价实现（见 config.go）。
-      exec "$bin" attach --dir "$PWD" -c "$url"
+      if has_session_via_server; then
+        exec "$bin" attach --dir "$PWD" -c "$url"
+      fi
+      exec "$bin" attach --dir "$PWD" "$url"
     fi
-    # 常驻 server 不可达时退回完整 TUI：同样继续上次会话并自动批准，
-    # 与 attach 路径的体验保持一致。
-    exec "$bin" -c --auto
+    # 常驻 server 不可达时退回完整 TUI：同样只在有历史会话时继续，并自动批准。
+    # 这里问不到常驻 server，改用 opencode 自己的会话列表探测（读同一个本地库）。
+    # 注意 session list 是全局的、不按目录过滤，必须自己比对 directory：
+    # 别的目录（如 /workspace 下的其他项目）有会话不算「当前目录可继续」，
+    # 否则仍会把 -c 带进无会话目录，复现 dummy 500。
+    sessions="$("$bin" session list -n 100 --format json 2>/dev/null || true)"
+    if [ -n "$sessions" ] && printf '%s' "$sessions" |
+      jq -e --arg d "$PWD" 'type == "array" and any(.[]; .directory == $d)' >/dev/null 2>&1; then
+      exec "$bin" -c --auto
+    fi
+    exec "$bin" --auto
   fi
 
   # `mai run`：常驻 server 可达时用 --attach 复用，避免在 CLI 进程内
