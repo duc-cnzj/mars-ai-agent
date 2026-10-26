@@ -41,13 +41,16 @@ const (
 // opencode 把 MCP 工具注册为 sanitize(服务名) + "_" + sanitize(工具名)。
 const mcpServerName = "mars-tools"
 
-// writeTools 是 mars MCP 的写操作工具。
+// writeTools 是 mars MCP 的写操作工具。mars 侧以 internal/services/mcp/tools.go
+// 的 writeAnnotations 为唯一判读依据，新增写工具时必须同步此清单。
 // 钉版 opencode（1.19.2）的 attach 子命令不支持 --auto，而 mai 默认走 attach
 // 复用常驻 server，因此这里在配置层显式 allow，等价于完整 TUI 的 --auto。
 // 注意：写工具不再弹客户端确认，人工确认由 agent 在对话中先行完成。
 // 服务端用 MCP readOnlyHint 标注读写语义，但钉版 opencode 不消费该注解，
 // 未配置权限规则时一律默认 allow——显式写 allow 是为了锁定行为，避免升级后默认值变化。
-var writeTools = []string{"apply_project", "toggle_hibernate", "restart_pod", "exec_command"}
+// update_repo_custom_fields 仅对管理员连接可见，但同为写工具，必须一并显式 allow，
+// 否则管理员沙箱里它会退回 opencode 的默认策略（当前 allow、未来可能漂移）。
+var writeTools = []string{"apply_project", "toggle_hibernate", "restart_pod", "exec_command", "update_repo_custom_fields"}
 
 // grayHeaderName 是 nginx-ingress canary 读取的灰度路由头；值为 always 时固定路由到灰度通道。
 const grayHeaderName = "mars_gray"
