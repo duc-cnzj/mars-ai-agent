@@ -9,10 +9,10 @@ mars-agent 已部署到命名空间 {{ .Release.Namespace }}。
 进入容器（镜像自带 bash）：
   kubectl -n {{ .Release.Namespace }} exec -it deploy/{{ include "mars-agent.fullname" . }} -- bash
 
-端点约定：
+端点约定（opencode 内核）：
   /         opencode Web UI
   /doc      OpenAPI 文档
-  /health   健康检查（探针使用）
+  /health   内核健康检查；K8s 探针统一经 `mars-agent health` 间接调用
 
 运行时配置：
   agent 启动时经 GET {{ .Values.mars.gatewayURL }}/api/ai/config 拉取模型等参数，

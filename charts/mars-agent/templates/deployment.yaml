@@ -71,26 +71,30 @@ spec:
               mountPath: /workspace
             - name: tmp
               mountPath: /tmp
-          # 探针直达 opencode serve 的 /health（wrapper exec 后进程即 opencode）。
+          # 探针调用 mars-agent health，由所选内核决定如何判断就绪：
+          # opencode 内部转发到自己的 /health。换内核时 chart 无需改动。
           startupProbe:
-            httpGet:
-              path: /health
-              port: http
+            exec:
+              command:
+                - /usr/local/bin/mars-agent
+                - health
             periodSeconds: 2
             timeoutSeconds: 2
             # 2s × 60 = 120s 冷启动窗口；超时才判定容器起不来。
             failureThreshold: 60
           readinessProbe:
-            httpGet:
-              path: /health
-              port: http
+            exec:
+              command:
+                - /usr/local/bin/mars-agent
+                - health
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
           livenessProbe:
-            httpGet:
-              path: /health
-              port: http
+            exec:
+              command:
+                - /usr/local/bin/mars-agent
+                - health
             periodSeconds: 20
             timeoutSeconds: 3
             failureThreshold: 3

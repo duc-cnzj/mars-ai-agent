@@ -58,7 +58,13 @@ agent_opencode:
 #   make agent_image APT_MIRROR=mirrors.ustc.edu.cn
 APT_MIRROR ?= deb.debian.org
 
+# 镜像内核默认用 UPX 压缩（~369MB → ~240MB）；运行时 RSS 约 +80~145MiB。
+# 内存限额紧时用 AGENT_UPX=0 关闭：make agent_image AGENT_UPX=0
+AGENT_UPX ?= 1
+
 # agent_image 构建沙箱镜像；需先 make agent_opencode 预置二进制（见 README.md）。
 .PHONY: agent_image
 agent_image:
-	docker build -t mars-agent:dev --build-arg APT_MIRROR=$(APT_MIRROR) .
+	docker build -t mars-agent:dev \
+		--build-arg APT_MIRROR=$(APT_MIRROR) \
+		--build-arg OPENCODE_UPX=$(AGENT_UPX) .

@@ -8,9 +8,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestEntrypointRetriesTransientFailure 网关先返回 5xx、随后恢复时，入口脚本应重试并成功。
@@ -177,6 +179,72 @@ func TestEntrypointGrayProbeFailOpen(t *testing.T) {
 	}
 	if got, _ := gotHeader.Load().(string); got != "" {
 		t.Errorf("探测失败时不应带 mars_gray，got %q", got)
+	}
+}
+
+// TestEntrypointSpawnsPrewarm 验证入口脚本在 exec 前台命令前拉起后台 prewarm。
+func TestEntrypointSpawnsPrewarm(t *testing.T) {
+	requireTooling(t, "sh", "curl", "jq")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/info":
+			_, _ = w.Write([]byte(`{"isGray":false}`))
+		case "/api/ai/config":
+			_, _ = w.Write([]byte(`{"model":"demo-model"}`))
+		default:
+			t.Errorf("意外请求路径 %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	logPath := filepath.Join(t.TempDir(), "calls.log")
+	fgPath := filepath.Join(t.TempDir(), "foreground")
+	bin := filepath.Join(t.TempDir(), "fake-agent")
+	// prewarm 分支会等待前台进程落一个标记文件：只有真的在后台并发执行，
+	// 前台才能先跑完；若被写成前台阻塞，它会等满 2s 并记录 prewarm-foreground。
+	script := `#!/bin/sh
+if [ "$1" = "prewarm" ]; then
+  i=0
+  while [ ! -f "$MARS_FOREGROUND" ] && [ "$i" -lt 200 ]; do
+    sleep 0.01
+    i=$((i + 1))
+  done
+  if [ -f "$MARS_FOREGROUND" ]; then
+    printf 'prewarm-background\n' >> "$MARS_LOG"
+  else
+    printf 'prewarm-foreground\n' >> "$MARS_LOG"
+  fi
+  exit 0
+fi
+: > "$MARS_FOREGROUND"
+printf 'foreground\n' >> "$MARS_LOG"
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("写 fake agent: %v", err)
+	}
+
+	_, stderr, code := runEntrypoint(t, srv.URL,
+		"MARS_AGENT_BIN="+bin, "MARS_LOG="+logPath, "MARS_FOREGROUND="+fgPath)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr)
+	}
+
+	// 后台进程与前台 exec 并发，轮询而不是固定 sleep。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		raw, _ := os.ReadFile(logPath)
+		log := string(raw)
+		if strings.Contains(log, "prewarm-foreground") {
+			t.Fatalf("prewarm 被前台阻塞执行（应为后台），记录: %q", log)
+		}
+		if strings.Contains(log, "foreground") && strings.Contains(log, "prewarm-background") {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("入口脚本未在后台拉起 prewarm，记录: %q", log)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

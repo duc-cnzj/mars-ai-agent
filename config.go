@@ -6,6 +6,15 @@ import (
 	"strings"
 )
 
+// 运行期默认值。集中在此，供严格入口（LoadEnv）与运行期子命令（loadRuntimeEnv）共用，
+// 避免两处默认值漂移。
+const (
+	defaultBackend    = "opencode"
+	defaultAIBin      = "/usr/local/bin/opencode"
+	defaultListenAddr = "0.0.0.0:4096"
+	defaultHome       = "/workspace"
+)
+
 // providerID 是写入 opencode 配置的 LLM 供应商标识，固定为 mars（指向 mars 的 LLM 代理）。
 const providerID = "mars"
 
@@ -51,8 +60,9 @@ type Env struct {
 	SessionToken string // MARS_SESSION_TOKEN：短期 scoped JWT，MCP、LLM 与配置接口共用
 	Gray         string // MARS_GRAY：灰度通道标记（always=灰度用户，空=非灰度）；由入口脚本探测后注入
 	Model        string // MARS_MODEL：模型 id（裸 id）；由入口脚本从 mars /api/ai/config 拉取后注入
-	AIBin        string // MARS_AI_BIN：底层 agent 二进制路径（默认 opencode，可替换其他内核）
-	ListenAddr   string // MARS_LISTEN_ADDR：opencode serve 监听地址
+	Backend      string // MARS_AGENT_BACKEND：agent 内核名（默认 opencode）
+	AIBin        string // MARS_AI_BIN：底层 agent 二进制路径（内核的路径覆盖）
+	ListenAddr   string // MARS_LISTEN_ADDR：内核服务监听地址
 	Home         string // HOME：配置与 skills 的落盘根
 }
 
@@ -64,20 +74,27 @@ func getenvDefault(key, def string) string {
 	return def
 }
 
-// LoadEnv 读取并校验环境变量。三个必填项缺失时一次性汇总报错，避免逐个试错。
-// 其中 MARS_MODEL 由镜像入口脚本（scripts/entrypoint.sh）先从 mars 配置接口拉取再注入。
-func LoadEnv() (Env, error) {
-	e := Env{
+// envFromOS 是环境变量到 Env 的唯一映射入口：严格与宽松入口共用，
+// 避免新增变量时只改一处导致默认值漂移。
+func envFromOS() Env {
+	return Env{
 		GatewayURL:   os.Getenv("MARS_GATEWAY_URL"),
 		LLMBaseURL:   os.Getenv("MARS_LLM_BASE_URL"),
 		MCPURL:       os.Getenv("MARS_MCP_URL"),
 		SessionToken: os.Getenv("MARS_SESSION_TOKEN"),
 		Gray:         os.Getenv("MARS_GRAY"),
 		Model:        os.Getenv("MARS_MODEL"),
-		AIBin:        getenvDefault("MARS_AI_BIN", "/usr/local/bin/opencode"),
-		ListenAddr:   getenvDefault("MARS_LISTEN_ADDR", "0.0.0.0:4096"),
-		Home:         getenvDefault("HOME", "/workspace"),
+		Backend:      getenvDefault("MARS_AGENT_BACKEND", defaultBackend),
+		AIBin:        getenvDefault("MARS_AI_BIN", defaultAIBin),
+		ListenAddr:   getenvDefault("MARS_LISTEN_ADDR", defaultListenAddr),
+		Home:         getenvDefault("HOME", defaultHome),
 	}
+}
+
+// LoadEnv 读取并校验环境变量。三个必填项缺失时一次性汇总报错，避免逐个试错。
+// 其中 MARS_MODEL 由镜像入口脚本（scripts/entrypoint.sh）先从 mars 配置接口拉取再注入。
+func LoadEnv() (Env, error) {
+	e := envFromOS()
 
 	var missing []string
 	if e.GatewayURL == "" {
@@ -93,6 +110,13 @@ func LoadEnv() (Env, error) {
 		return Env{}, fmt.Errorf("缺少必填环境变量: %s", strings.Join(missing, ", "))
 	}
 	return e, nil
+}
+
+// loadRuntimeEnv 读取运行期子命令（mai/health/mcp-wait/prewarm）所需的环境变量：
+// 只填默认值、不做必填校验。这些命令可能运行在容器启动早期或用户终端里，
+// 不应因为 mars 配置尚未注入而拒绝工作（与迁移前的 shell 脚本口径一致）。
+func loadRuntimeEnv() Env {
+	return envFromOS()
 }
 
 // Config 是 opencode.json 的结构化表示，字段形态对应 opencode v1 配置规范。

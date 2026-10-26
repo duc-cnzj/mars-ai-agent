@@ -4,6 +4,10 @@
 # 二进制由 `README.md` 描述的步骤，以"钉版本 + 校验 SHA256"的方式预置到构建上下文
 # vendor/opencode/opencode-linux-{amd64,arm64}，再由本文件 COPY 进来（构建上下文 = 仓库根）。
 # 生产环境应进一步以镜像 digest + cosign 验签分发。
+#
+# 内核在 COPY 进运行层之前用 UPX 压缩（约 30%），镜像从 ~369MB 降到 ~240MB。
+# 代价是运行时解压到匿名内存：serve 进程 RSS 约 +80~145MiB。内存限额紧的场景
+# 用 `--build-arg OPENCODE_UPX=0` 关闭压缩。
 
 # 构建阶段固定跑在构建机架构（BUILDPLATFORM），由 Go 交叉编译到 TARGETARCH：
 # 多架构 buildx 下不会让 arm64 的整套 Go 工具链跑在 QEMU 模拟里，编译接近原生速度。
@@ -23,6 +27,25 @@ COPY skills ./skills
 COPY tui ./tui
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -trimpath -ldflags="-s -w" -o /out/mars-agent .
+
+# UPX 打包阶段：固定跑在构建机架构（BUILDPLATFORM），与 TARGETARCH 无关，
+# 在构建机上原生压缩两架构的内核；多架构 buildx 不会为 UPX 再起 QEMU。
+# 版本钉死 5.0.2（已验证可压 linux/amd64 与 linux/arm64）；升级 UPX 必须重跑双架构运行时冒烟。
+# upx 必须在**同一阶段**安装：单拷 /usr/bin/upx 到干净镜像会缺 libstdc++ 等运行库（exit 127）。
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS packer
+ARG TARGETARCH
+ARG OPENCODE_UPX=1
+RUN apk add --no-cache upx=5.0.2-r0
+COPY vendor/opencode/opencode-linux-${TARGETARCH} /in/opencode
+RUN set -eux; \
+    mkdir -p /out; \
+    if [ "$OPENCODE_UPX" = "1" ]; then \
+      upx -9 --no-progress -o /out/opencode /in/opencode; \
+    else \
+      cp /in/opencode /out/opencode; \
+    fi; \
+    rm -rf /in; \
+    ls -l /out/opencode
 
 # 运行时基座：debian-slim（glibc，与预置 opencode 二进制 ABI 一致）+ 一组精选常用排查工具。
 # 不用 alpine/musl——opencode 是 glibc 变体，musl 下跑不起来。
@@ -62,14 +85,13 @@ RUN printf '%s\n' 'PS1="mars-agent:\w\$ "' >> /etc/bash.bashrc
 
 WORKDIR /workspace
 
-# 按目标架构拷入对应的 glibc 版 opencode 二进制（预置在构建上下文；见 README.md）。
-COPY vendor/opencode/opencode-linux-${TARGETARCH} /usr/local/bin/opencode
-# 用户面向的稳定入口 mai：底层 agent 由 MARS_AI_BIN 指定（默认 opencode），
-# 以后换 claude code 等内核时用户命令不变。
+# 拷入按目标架构压缩后的 glibc 版 opencode（压缩在上方 packer 阶段完成）。
+# 必须在写入运行层之前压好：镜像层是叠加的，先拷原件再压不会减小体积。
+COPY --from=packer /out/opencode /usr/local/bin/opencode
+# 用户面向的稳定入口 mai：底层内核由 MARS_AGENT_BACKEND 选择（默认 opencode），
+# 换内核时用户命令不变。全部内核逻辑在 mars-agent 内。
 COPY scripts/mai.sh /usr/local/bin/mai
-# MCP 就绪等待：entrypoint 后台预热与 mai 进入 TUI 前的兜底共用同一份逻辑。
-COPY scripts/mcp-wait.sh /usr/local/bin/mars-mcp-wait
-RUN chmod 0755 /usr/local/bin/mai /usr/local/bin/mars-mcp-wait
+RUN chmod 0755 /usr/local/bin/mai
 # mars-agent wrapper（Skills 已 //go:embed 进二进制）
 COPY --from=builder /out/mars-agent /usr/local/bin/mars-agent
 # 入口脚本：启动时用 gatewayURL + token 拉取 mars 配置（模型）注入环境，再交给 wrapper。

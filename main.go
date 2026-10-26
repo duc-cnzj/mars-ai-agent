@@ -1,81 +1,43 @@
 // Package main 是沙箱侧 mars-agent 的入口。
 //
-// 它只做三件事：校验 mars 注入的环境变量（其中模型由入口脚本经配置接口补齐）、
-// 生成 opencode 配置与知识型 Skills，
-// 然后 exec 成常驻的 opencode serve 服务（用户经项目终端 `mai` 在沙箱内直接使用）。
-// 沙箱侧不 import mars 任何代码，与 mars 之间只经 MCP / HTTP 交互。
+// 它按子命令执行：
+//   - serve（默认）：校验 mars 注入的环境变量、生成内核配置与知识型 Skills，
+//     然后 exec 成常驻的 agent 服务（用户经项目终端 `mai` 在沙箱内直接使用）。
+//   - mai/health/mcp-wait/prewarm：用户入口、K8s 探针与启动预热。
+//
+// 内核由 MARS_AGENT_BACKEND 选择（P0 只有 opencode），所有内核特化逻辑收敛在
+// Backend 实现中。沙箱侧不 import mars 任何代码，与 mars 之间只经 MCP / HTTP 交互。
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"log"
-	"net"
 	"os"
-	"path/filepath"
+	"os/exec"
+	"strings"
 	"syscall"
 )
 
 // main 是进程入口：启动失败即打印原因并以非 0 退出（fail fast，起不来就别起）。
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "mars-agent: %v\n", err)
-		os.Exit(1)
-	}
+	os.Exit(dispatch(os.Args[1:], os.Stderr, execCmd))
 }
 
-// run 执行启动流程：加载 env → 落配置 → 落 skills → exec opencode serve。
-// 返回非 nil 错误表示启动失败（调用方据此退出）。
-func run() error {
-	env, err := LoadEnv()
+// execCmd 用 exec 替换当前进程：让底层 agent 成为 PID 1，信号直传；
+// 探针通过 `mars-agent health` 转调所选内核的健康检查。
+func execCmd(c Cmd) error {
+	file, err := resolveExecPath(c.Path)
 	if err != nil {
 		return err
 	}
-
-	data, err := json.MarshalIndent(BuildConfig(env), "", "  ")
-	if err != nil {
-		return fmt.Errorf("序列化 opencode 配置失败: %w", err)
-	}
-
-	cfgDir := filepath.Join(env.Home, ".config", "opencode")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		return fmt.Errorf("创建配置目录 %s 失败: %w", cfgDir, err)
-	}
-	cfgPath := filepath.Join(cfgDir, "opencode.json")
-	if err := os.WriteFile(cfgPath, data, 0o600); err != nil {
-		return fmt.Errorf("写入 opencode 配置 %s 失败: %w", cfgPath, err)
-	}
-	if err := MaterializeSkills(filepath.Join(cfgDir, "skills")); err != nil {
-		return fmt.Errorf("落盘 skills 失败: %w", err)
-	}
-	// TUI 品牌定制：替换启动页 logo（tui.json 引用 ./plugins/mars-logo.tsx）。
-	if err := MaterializeTUI(cfgDir); err != nil {
-		return fmt.Errorf("落盘 TUI 配置失败: %w", err)
-	}
-	// 初始化 TUI 偏好：关闭首页通用 tips，并默认关闭 spinner 动画（57fps 空转
-	// 会吃满一个核，表现为输入/滚动卡顿）。best-effort：kv.json 损坏或 opencode
-	// 升级改了键值格式，都不应让用户失去整个沙箱终端。
-	if err := ApplyTUIPrefs(env.Home); err != nil {
-		log.Printf("mars-agent: 初始化 TUI 偏好失败（忽略，不影响启动）: %v", err)
-	}
-
-	args, err := serveArgs(env)
-	if err != nil {
-		return err
-	}
-	log.Printf("mars-agent: 配置已写入 %s，启动 %s", cfgPath, env.AIBin)
-	// 用 exec 替换当前进程：让底层 agent 成为 PID 1，信号直传、探针直打其 /health。
-	return syscall.Exec(env.AIBin, append([]string{env.AIBin}, args...), os.Environ())
+	// argv[0] 保留调用方给的写法，与 shell `exec "$bin"` 一致。
+	return syscall.Exec(file, append([]string{c.Path}, c.Args...), os.Environ())
 }
 
-// serveArgs 依据监听地址构造 opencode serve 的命令行参数。
-//
-// ⚠️ 参数名（--hostname/--port）必须与镜像钉死的 opencode 版本核对；
-// opencode 升级若改了 CLI，只需改动此函数一处。
-func serveArgs(env Env) ([]string, error) {
-	host, port, err := net.SplitHostPort(env.ListenAddr)
-	if err != nil {
-		return nil, fmt.Errorf("解析 MARS_LISTEN_ADDR %q 失败: %w", env.ListenAddr, err)
+// resolveExecPath 还原 shell `exec` 的语义：含路径分隔符时按路径执行，
+// 否则走 PATH 查找。旧 mai.sh 直接 `exec "$bin"`，`MARS_AI_BIN=opencode`
+// 这类裸名字可用；syscall.Exec 不做 PATH 查找，这里补上以免行为回归。
+func resolveExecPath(path string) (string, error) {
+	if strings.ContainsRune(path, os.PathSeparator) {
+		return path, nil
 	}
-	return []string{"serve", "--hostname", host, "--port", port}, nil
+	return exec.LookPath(path)
 }

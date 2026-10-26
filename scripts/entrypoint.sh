@@ -104,20 +104,13 @@ fi
 #
 # opencode 启动时会自己尝试连一次 MCP，但网关/网络尚未就绪时会失败且状态粘住，
 # 网关恢复后也不会自动重连。这里在容器启动后立刻异步预热并重试，用户打开终端
-# 时通常已就绪，避免每次进 TUI 都现场等待。预热脚本会先等 server 的 /health，
+# 时通常已就绪，避免每次进 TUI 都现场等待。预热会先等内核 server 的 /health，
 # 因此可以安全地放在 exec 之前；后台任务不阻塞容器启动。
-# 等待上限可用 MARS_MCP_PREWARM_TIMEOUT 调整（秒，0 表示不预热）。
-# best-effort：预热失败只影响工具可用性，不影响 shell / TUI 启动。
-prewarm="${MARS_MCP_PREWARM_TIMEOUT:-120}"
-mcp_wait_bin="${MARS_MCP_WAIT_BIN:-/usr/local/bin/mars-mcp-wait}"
-ai_bin="${MARS_AI_BIN:-/usr/local/bin/opencode}"
-if [ "$(basename "$ai_bin")" = "opencode" ] &&
-  [ "$prewarm" -gt 0 ] 2>/dev/null && [ -x "$mcp_wait_bin" ]; then
-  "$mcp_wait_bin" \
-    --dir "${HOME:-/workspace}" \
-    --timeout "$prewarm" \
-    --server-timeout 60 &
-fi
-
+#
+# 预热哪些内核、等多久由 mars-agent 按 MARS_AGENT_BACKEND / MARS_MCP_PREWARM_TIMEOUT
+# 决定（秒，0 表示不预热）。best-effort：失败只影响工具可用性，不影响 shell / TUI 启动。
 # MARS_AGENT_BIN 仅供本地测试/调试替换被 exec 的二进制，生产镜像默认无需设置。
-exec "${MARS_AGENT_BIN:-/usr/local/bin/mars-agent}" "$@"
+agent_bin="${MARS_AGENT_BIN:-/usr/local/bin/mars-agent}"
+"$agent_bin" prewarm &
+
+exec "$agent_bin" "$@"

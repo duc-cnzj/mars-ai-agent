@@ -12,6 +12,7 @@ func TestLoadEnv_Defaults(t *testing.T) {
 	t.Setenv("MARS_SESSION_TOKEN", "tok")
 	t.Setenv("MARS_MODEL", "m1")
 	t.Setenv("MARS_AI_BIN", "")
+	t.Setenv("MARS_AGENT_BACKEND", "")
 	t.Setenv("MARS_LISTEN_ADDR", "")
 	t.Setenv("HOME", "")
 	t.Setenv("MARS_LLM_BASE_URL", "")
@@ -24,6 +25,9 @@ func TestLoadEnv_Defaults(t *testing.T) {
 	}
 	if env.AIBin != "/usr/local/bin/opencode" {
 		t.Errorf("AIBin = %q, want 默认值", env.AIBin)
+	}
+	if env.Backend != defaultBackend {
+		t.Errorf("Backend = %q, want %q", env.Backend, defaultBackend)
 	}
 	if env.ListenAddr != "0.0.0.0:4096" {
 		t.Errorf("ListenAddr = %q, want 默认值", env.ListenAddr)

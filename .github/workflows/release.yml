@@ -74,15 +74,81 @@ jobs:
             echo "chart 不应注入 MARS_MODEL（模型由入口脚本从 mars 拉取）" >&2
             exit 1
           fi
+          # 探针必须走 mars-agent health（内核无关），不能再直打 opencode 的 /health。
+          if grep -qE '^[[:space:]]*httpGet:' <<<"$out"; then
+            echo "探针不应使用 httpGet，应统一调用 mars-agent health" >&2
+            exit 1
+          fi
+          if [ "$(grep -c '/usr/local/bin/mars-agent' <<<"$out")" -lt 3 ]; then
+            echo "未找到三个 exec 探针（mars-agent health）" >&2
+            exit 1
+          fi
+          # 只校验二进制出现次数不够：探针误写成 serve 会在容器里再起一份内核。
+          if [ "$(grep -cE '^[[:space:]]*- health$' <<<"$out")" -lt 3 ]; then
+            echo "三个探针必须执行 mars-agent health 子命令" >&2
+            exit 1
+          fi
+          if grep -qE '^[[:space:]]*- (serve|mai|mcp-wait|prewarm)$' <<<"$out"; then
+            echo "探针不应执行 serve/mai/mcp-wait/prewarm" >&2
+            exit 1
+          fi
           echo "helm 门禁通过"
 
       - name: 构建 wrapper
         run: make agent
 
+  # UPX 是运行时解压：必须先证明压缩后的内核真能跑、探针真能通，再允许推送。
+  # CI runner 是 amd64，这里验证 amd64；arm64 走同一条 packer 交叉压缩路径，
+  # 发布前另需在 arm64 机器上跑一次同样的运行时冒烟（见 README「镜像体积与内存权衡」）。
+  image-smoke:
+    name: UPX 镜像冒烟（amd64）
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 预置 amd64 opencode（含 sha256 校验）
+        run: make agent_opencode ARCHS=amd64
+
+      - name: 构建压缩镜像
+        run: docker build --platform linux/amd64 --build-arg OPENCODE_UPX=1 -t mars-agent:smoke .
+
+      - name: 断言内核已压缩且可执行
+        run: |
+          size="$(docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'stat -c %s /usr/local/bin/opencode')"
+          orig="$(stat -c %s vendor/opencode/opencode-linux-amd64)"
+          echo "opencode: ${orig} -> ${size} bytes"
+          if [ "$size" -ge "$((orig * 4 / 10))" ]; then
+            echo "内核未达到压缩预期（应 < 原体积 40%）" >&2
+            exit 1
+          fi
+          docker run --rm --entrypoint /usr/local/bin/opencode mars-agent:smoke --version
+
+      - name: 启动 serve 并验证 health 探针
+        run: |
+          docker run -d --name smoke -p 4096:4096 \
+            --entrypoint /usr/local/bin/opencode mars-agent:smoke \
+            serve --hostname 0.0.0.0 --port 4096
+          trap 'docker rm -f smoke' EXIT
+          ok=0
+          for i in $(seq 1 60); do
+            if curl -sf -m 1 http://127.0.0.1:4096/health >/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" != 1 ]; then
+            echo "serve 未在 60s 内就绪" >&2
+            docker logs smoke >&2 || true
+            exit 1
+          fi
+          # 与 K8s exec 探针同口径：共享 server 的网络命名空间执行 mars-agent health。
+          docker run --rm --network container:smoke \
+            --entrypoint /usr/local/bin/mars-agent mars-agent:smoke health
+
   buildx:
     name: 构建并推送镜像（amd64 + arm64）
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, image-smoke]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -123,6 +189,8 @@ jobs:
         with:
           context: .
           platforms: linux/arm64,linux/amd64
+          # 默认即为 1；显式写出，避免 Dockerfile 默认值变更时静默失去压缩。
+          build-args: OPENCODE_UPX=1
           push: true
           # 与 mars 主仓一致：不打 attestation。
           provenance: false

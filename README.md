@@ -1,22 +1,51 @@
 # mars-agent（沙箱侧 AI 助手）
 
 mars「AI 容器排查助手」的**沙箱侧组件**。每个用户独占一个沙箱（单副本 Deployment），
-沙箱内运行本镜像：它以 **opencode** 为 agent 内核，把 LLM 调用与工具调用统统导回 mars。
+沙箱内运行本镜像：它以可插拔的 agent 内核（默认 **opencode**）承接 LLM 调用，
+并把工具调用统统导回 mars。
 
 ## 职责（只做三件事）
 
 1. 校验 mars 注入的环境变量；入口脚本先用网关地址 + 令牌向 mars 拉取运行时配置（模型）
-2. 生成 opencode 配置：LLM provider 指向 mars LLM 代理、MCP 工具指向 mars 工具服务
-3. 落盘知识型 Skills，然后 `exec` 成常驻的 `opencode serve`
+2. 按所选内核生成配置：LLM 指向 mars LLM 代理、MCP 工具指向 mars 工具服务
+3. 落盘知识型 Skills，然后 `exec` 成常驻的内核服务
 
 > 配置只有一个来源：mars 的 `ai` 配置段。chart 只下发 `mars.gatewayURL` 与会话令牌，
 > agent 启动时经 `GET <gateway>/api/ai/config` 拿到模型，因此进入 opencode 无需任何额外参数。
 
-> LLM 循环由 opencode 自己跑，mars 服务端不重复实现 agent。用户在项目终端里通过
-> `mai` 直接使用沙箱内的 opencode TUI，mars 以 MCP 形式向它暴露受 RBAC 约束的工具。
+> LLM 循环由内核自己跑，mars 服务端不重复实现 agent。用户在项目终端里通过
+> `mai` 直接使用沙箱内的 TUI，mars 以 MCP 形式向它暴露受 RBAC 约束的工具。
 > 写操作在客户端自动批准（等价 `--auto`，见 `config.go` 的 permission 规则），
 > 人工确认由 agent 在对话中先行完成。
 > 本模块**不 import mars 任何代码**，与 mars 之间只经 MCP / HTTP 交互。
+
+## 内核抽象（Backend）
+
+所有内核相关知识由 `Backend` 接口收口（`backend.go`），由 `MARS_AGENT_BACKEND` 选择，
+默认 `opencode`。Shell 不再按二进制 basename 分支；`mai`、探针、MCP 预热都调用
+`mars-agent` 的同一套子命令：
+
+| 子命令 | 用途 |
+|---|---|
+| `serve`（默认） | 容器 PID 1：落配置 → exec 内核 |
+| `mai` | 用户交互入口（`/usr/local/bin/mai` 只是薄包装） |
+| `health` | K8s exec 探针 |
+| `mcp-wait` | 等待 MCP 工具服务就绪 |
+| `prewarm` | 启动后后台预热 MCP |
+
+能力差异用 `Capabilities` 声明（常驻 server / attach / MCP 探测 / 会话续接 / 品牌定制）。
+其中 `MCPProbe` 已参与决策：`mcp-wait` 与 `prewarm` 对不支持 MCP 探测的内核直接返回成功，
+不会空转等待；其余能力位目前是自描述，供文档、测试与后续多内核裁剪使用。
+新增内核 = 在 `backendRegistry` 注册一个实现并构建对应镜像变体；Shell 脚本无需改动
+（chart 仅在需要注入非默认 `MARS_AGENT_BACKEND` 时才需调整）。
+
+> P0 只落地 opencode。适配 Claude Code 还需要三件事：Claude 适配器、mars 侧
+> Anthropic Messages 兼容代理（当前 `/llm/v1` 是 OpenAI 兼容协议），以及按后端
+> 构建镜像变体。`MARS_AI_BIN` 只是路径覆盖，不能单独完成换内核。
+
+> 迁移提示：旧版 `mai` 在 `MARS_AI_BIN` 的 basename 不是 `opencode` 时会把参数原样
+> 透传给该二进制；P0 起内核由 `MARS_AGENT_BACKEND` 选择，未注册的内核会 fail fast。
+> 仅修改 `MARS_AI_BIN` 不再等同于换内核。
 
 ## 环境变量契约（由沙箱 Pod manifest 注入）
 
@@ -26,11 +55,12 @@ mars「AI 容器排查助手」的**沙箱侧组件**。每个用户独占一个
 | `MARS_SESSION_TOKEN` | ✅ | — | 短期 scoped JWT，MCP、LLM 与配置接口共用；**绝不接受用户真实 token** |
 | `MARS_MODEL` | | 由入口脚本拉取 | 模型 id（裸 id，非 provider 限定名；配置里会写成 `mars/<id>`）。显式设置时跳过拉取 |
 | `MARS_GRAY` | | 由入口脚本探测 | 灰度通道标记（`always`=灰度用户，空=非灰度）。非空时 LLM 与 MCP 请求都带 `mars_gray` 头；显式设置时跳过探测 |
-| `MARS_AI_BIN` | | `/usr/local/bin/opencode` | 底层 agent 二进制路径（`mai` 与服务进程共用；可替换成 claude code 等） |
-| `MARS_LISTEN_ADDR` | | `0.0.0.0:4096` | opencode serve 监听地址 |
+| `MARS_AGENT_BACKEND` | | `opencode` | agent 内核选择（P0 仅 `opencode`；新增内核需在 `backendRegistry` 注册） |
+| `MARS_AI_BIN` | | `/usr/local/bin/opencode` | 内核二进制**路径覆盖**（只解决"二进制在哪"，不改变协议/配置形态） |
+| `MARS_LISTEN_ADDR` | | `0.0.0.0:4096` | 内核服务监听地址 |
 | `MARS_MCP_WAIT_TIMEOUT` | | `15` | `mai` 进入 TUI 前等待 MCP 就绪的上限（秒，0=不等待） |
 | `MARS_MCP_PREWARM_TIMEOUT` | | `120` | 容器启动后后台预热 MCP 的上限（秒，0=不预热） |
-| `HOME` | | `/workspace` | 配置与 skills 的落盘根（`$HOME/.config/opencode/`） |
+| `HOME` | | `/workspace` | 配置与 skills 的落盘根（opencode 为 `$HOME/.config/opencode/`） |
 
 入口脚本 `scripts/entrypoint.sh` 在启动时调用 mars 配置接口补齐 `MARS_MODEL`：
 
@@ -63,9 +93,9 @@ LLM 供应商的 `options.headers` 与 MCP 服务的 `headers` 各带一份 `mar
 
 opencode 只在 instance 创建时连一次 MCP，失败后状态会粘住（`status=failed`），
 网关恢复后也不会自动重连；且 `POST /mcp/<name>/connect` 只发起连接、不等待完成。
-因此启动链路分两层保证：
+因此启动链路分两层保证（等待逻辑已收敛到 `mars-agent` 的 `WaitMCP`，按内核能力执行）：
 
-1. **容器启动预热**：入口脚本在 `exec` 前拉起后台 `mars-mcp-wait`，等 opencode
+1. **容器启动预热**：入口脚本在 `exec` 前拉起后台 `mars-agent prewarm`，等内核
    `/health` 可达后重连 MCP 并轮询到 `connected`（默认最多 120s，可重试覆盖
    网关尚未就绪的情况）。用户打开终端时通常已就绪。
 2. **进入 TUI 前兜底**：`mai` attach 前再等待一次（默认 15s），覆盖非
@@ -78,17 +108,23 @@ opencode 只在 instance 创建时连一次 MCP，失败后状态会粘住（`st
 ```
 .
 ├── scripts/                        镜像内 shell 脚本
-│   ├── entrypoint.sh               容器入口：拉取 mars 配置、后台预热 MCP，再交给 wrapper
-│   ├── mai.sh                      用户面向的稳定入口（mai → MARS_AI_BIN，默认 opencode；attach 前等待 MCP 就绪）
-│   └── mcp-wait.sh                 MCP 就绪等待（轮询 /mcp + connect），启动预热与 TUI 兜底共用
-├── main.go                         入口：校验 → 落配置/skills → exec 底层 agent serve
-├── config.go                       生成 opencode.json（LLM/MCP 指向 mars）
+│   ├── entrypoint.sh               容器入口：拉取 mars 配置、后台 prewarm，再交给 wrapper
+│   └── mai.sh                      稳定入口：exec mars-agent mai
+├── main.go                         子命令分发；默认 serve（容器 PID 1）
+├── cli.go                          serve/mai/health/mcp-wait/prewarm 实现
+├── backend.go                      Backend 接口、能力位、注册表
+├── backend_opencode.go             opencode 适配器（Prepare/Launch/Health/Interactive）
+├── mai.go                          mai 的探测与命令规划（原 mai.sh 逻辑）
+├── mcpwait.go                      MCP 就绪等待（原 mcp-wait.sh 逻辑）
+├── httpx.go                        探测用 HTTP 客户端（禁重定向）
+├── config.go                       共享契约 + opencode.json 生成
+├── tui.go                          opencode TUI 资产与偏好
 ├── skills.go                       //go:embed skills + 只读落盘
 ├── skills/                         知识型 Skills（纯知识，无执行权）
 │   ├── mars-resource-model/SKILL.md
 │   └── crashloop-triage/SKILL.md
 ├── tui/                            opencode TUI 定制（tui.json + 启动页 logo / 能力清单插件）
-├── Dockerfile                      镜像：钉版 opencode + wrapper + skills
+├── Dockerfile                      镜像：钉版 opencode（UPX 压缩）+ wrapper + skills
 └── vendor/opencode/                预置的 opencode 二进制（git 忽略，见下）
 ```
 
@@ -121,7 +157,7 @@ MARS_AGENT_BIN=/bin/echo sh scripts/entrypoint.sh ok
 
 | 工作流 | 触发 | 做什么 |
 |---|---|---|
-| `.github/workflows/release.yml` | 打 `v*` tag | 发布门禁（gofmt → `go vet` → `go test -race` → `make agent`，并对 chart 跑 `helm lint` + 渲染断言），通过后构建 `linux/amd64,linux/arm64` 镜像并推送（口径与 mars 主仓一致） |
+| `.github/workflows/release.yml` | 打 `v*` tag | 发布门禁（gofmt → `go vet` → `go test -race` → `make agent`，并对 chart 跑 `helm lint` + 渲染断言），再对 UPX 压缩后的 amd64 镜像做运行时冒烟（内核可执行、`serve` 就绪、`mars-agent health` 通过），全绿后才构建 `linux/amd64,linux/arm64` 镜像并推送（口径与 mars 主仓一致） |
 
 > 仓库只有发布流水线，没有 PR / 分支 CI：合入前的检查请在本地跑
 > `make agent_test`，chart 改动再跑一遍下文「Helm 部署」里的 `helm lint` / `helm template`。
@@ -188,13 +224,36 @@ mai                  # 交互式 TUI：复用常驻 server、有历史会话时�
 mai run "你好"        # 非交互跑一句：常驻 server 可达时用 --attach 复用
 ```
 
-> `mai` 是镜像内置的稳定入口（`/usr/local/bin/mai`），底层实际执行
-> `$MARS_AI_BIN`（默认 `/usr/local/bin/opencode`）。以后换底层内核（如 claude code）
-> 只需改这个环境变量指向新二进制，用户命令与本文档都不用动；`opencode` 仍可直接使用。
+> `mai` 是镜像内置的稳定入口（`/usr/local/bin/mai`），实际执行 `mars-agent mai`，
+> 由 `MARS_AGENT_BACKEND` 选择内核（默认 opencode）。切换内核时用户命令不变；
+> `opencode` 仍可直接使用。
 
 > 想让 LLM 指向真实端点而非 mars 代理，加 `-e MARS_LLM_BASE_URL=<openai兼容>/v1`
 > 并把令牌换成该端点 key——**改 env 即可，不改代码不重编**。
 > 受限网络构建时换 apt 源：`make agent_image APT_MIRROR=mirrors.ustc.edu.cn`。
+
+### 镜像体积与内存权衡
+
+镜像默认用 UPX 5.0.2 压缩 opencode 内核（在写入运行层之前完成）：
+
+| | 未压缩 | UPX `-9` |
+|---|---|---|
+| 内核二进制（arm64） | 185.5 MB | 56.3 MB（30.4%） |
+| 镜像（arm64） | ~369 MB | ~240 MB（-35%） |
+| `serve` 进程 RSS | ~335 MB | ~415–440 MB（+80~145 MB） |
+
+UPX 是**运行时解压**，内存占用计入进程匿名页，不能像普通二进制那样被多进程共享。
+内存限额较紧、或安全扫描禁止 packed ELF 时关闭压缩：
+
+```bash
+make agent_image AGENT_UPX=0          # 本地构建
+# release 的 buildx 同理：把 build-args 改成 OPENCODE_UPX=0
+```
+
+压缩顺序不能颠倒：镜像层是叠加的，必须先压好再 `COPY` 进运行层，否则原件层仍会占体积。
+
+CI 的运行时冒烟跑在 amd64 runner 上（`image-smoke`）；arm64 产物由同一条 packer
+交叉压缩路径生成，发布前需在 arm64 机器上补跑一次 `serve` + `mars-agent health` 冒烟。
 
 ## Helm 部署
 
@@ -215,8 +274,8 @@ helm install alice ./charts/mars-agent \
 | `mars.gatewayURL` | mars 网关地址（默认 `http://mars-server.mars.svc:9000`） |
 | `mars.token` | 会话令牌（短期 scoped JWT）；为空则安装直接失败（fail fast） |
 | `image.repository` | 镜像仓库（默认 `registry.cn-hangzhou.aliyuncs.com/duc-cnzj/mars-agent`） |
-| `image.tag` | 镜像 tag（默认取 `Chart.appVersion`；`values.yaml` 中留空） |
-| `image.pullPolicy` | 拉取策略（默认 `IfNotPresent`） |
+| `image.tag` | 镜像 tag（`values.yaml` 默认 `latest`；置空则取 `Chart.appVersion`） |
+| `image.pullPolicy` | 拉取策略（默认 `Always`） |
 | `imagePullSecrets` | 私有仓库拉取凭据（可选） |
 | `podAnnotations` | 追加到 Pod 的注解 |
 | `resources` | 资源请求/限制 |
@@ -248,9 +307,10 @@ helm template smoke charts/mars-agent --set mars.token=demo-token
 1. 确定要钉的 opencode 版本，从其 release 页取得对应架构（linux amd64/arm64）的二进制与 SHA256。
 2. 将二进制放到 `vendor/opencode/opencode-linux-{amd64,arm64}`，并**核对校验和**
    （或用 `make agent_opencode` 按 Makefile 中钉死的版本与 digest 自动下载、校验并落位）。
-3. `make agent_image` 构建镜像。
+3. `make agent_image` 构建镜像（默认用 UPX 5.0.2 压缩内核；关闭方式见「镜像体积与内存权衡」）。
 
 > ⚠️ 只钉版本不校验和 = 没钉。生产分发应进一步以镜像 digest + cosign 验签。
+> 升级 UPX 版本必须重跑 `image-smoke`（amd64 运行时冒烟）并验证 arm64 镜像，不能只看压缩率。
 
 ## 与 opencode 版本强耦合的点（升级时必查）
 
@@ -259,21 +319,21 @@ helm template smoke charts/mars-agent --set mars.token=demo-token
 - `config.go` 的 `permission` 规则键：opencode 把 MCP 工具注册为 `sanitize(服务名)_sanitize(工具名)`
   （当前为 `mars-tools_<tool>`）；且**不消费** MCP 的 `readOnlyHint`，未配置规则时默认 allow。
   写工具显式配 `allow` 以等价 `--auto`——attach 子命令本身不支持 `--auto`。
-- `scripts/mai.sh` 的 `attach` 参数：钉版 opencode 仅支持 `-c/--continue`，不支持 `--auto`；
+- `mai.go` 的 `planMai` / `attach` 参数：钉版 opencode 仅支持 `-c/--continue`，不支持 `--auto`；
   升级若给 attach 补上 `--auto`，可改回直传并移除配置层的 allow 兜底。
 - **`-c/--continue` 只能在有历史会话时传**：opencode 1.19.2 在无会话可继续时会把占位
   sessionID `dummy` 作为 TUI 初始路由发给服务端，服务端按 `ses` 前缀校验失败返回 500，
   TUI 启动页显示 `Unexpected server error. Check server logs for details.`（`mai`
   已先探测会话列表再决定是否带 `-c`；升级 opencode 后应回归这一场景）。
-- `main.go` 的 `opencode serve` 参数名（`--hostname` / `--port`）。
+- `backend_opencode.go` 的 `serveArgs`（`opencode serve` 的 `--hostname` / `--port`）。
 - Skills 的发现路径（`$HOME/.config/opencode/skills/`）。
 - `tui/plugins/mars-logo.tsx` 使用的 `home_logo` 插槽与 TUI 插件 API（TUI 配置为 `tui.json`）。
-- `tui.go` 的 `DisableTips` 依赖 TUI 键值存储路径（`$XDG_STATE_HOME/opencode/kv.json`，
+- `tui.go` 的 `ApplyTUIPrefs` 依赖 TUI 键值存储路径（`$XDG_STATE_HOME/opencode/kv.json`，
   默认 `$HOME/.local/state/opencode/kv.json`）与内置 tips 的开关键 `tips_hidden`。
-- chart 的 startup / readiness / liveness 探针都打 opencode 的 `/health`（`deployment.yaml`），
-  路径变化会让 Pod 永远不就绪。
+- `backend_opencode.go` 的 `Health` 依赖 opencode 的 `/health`；chart 探针已改为
+  `mars-agent health`，路径变化只影响该适配器，不会让 chart 与具体内核耦合。
 
-六者都已在代码内集中标注，升级只需改动对应单点。
+这些点都集中在 `opencode` 适配器与配置文件内，升级只需改动对应单点。
 
 ## 安全设计要点
 
