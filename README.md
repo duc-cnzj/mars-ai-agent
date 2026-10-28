@@ -1,5 +1,9 @@
 # mars-agent（沙箱侧 AI 助手）
 
+> 仓库：[duc-cnzj/mars-ai-agent](https://github.com/duc-cnzj/mars-ai-agent)。三个名字各司其职：
+> GitHub 仓库名 `mars-ai-agent`，Go module 路径 `github.com/duc-cnzj/mars-ai-agent`，
+> 镜像与二进制名 `mars-agent`。
+
 mars「AI 容器排查助手」的**沙箱侧组件**。每个用户独占一个沙箱（单副本 Deployment），
 沙箱内运行本镜像：它以可插拔的 agent 内核（默认 **opencode**）承接 LLM 调用，
 并把工具调用统统导回 mars。
@@ -51,7 +55,7 @@ mars「AI 容器排查助手」的**沙箱侧组件**。每个用户独占一个
 
 | 变量 | 必填 | 默认 | 用途 |
 |---|---|---|---|
-| `MARS_GATEWAY_URL` | ✅ | — | mars 网关地址（MCP + LLM 代理 + 运行时配置），如 `http://mars-server.mars.svc:9000` |
+| `MARS_GATEWAY_URL` | ✅ | — | mars 网关地址（MCP + LLM 代理 + 运行时配置），如 `http://mars-server.mars.svc:9000`（示例，按实际 mars Service 覆盖） |
 | `MARS_SESSION_TOKEN` | ✅ | — | 短期 scoped JWT，MCP、LLM 与配置接口共用；**绝不接受用户真实 token** |
 | `MARS_MODEL` | | 由入口脚本拉取 | 模型 id（裸 id，非 provider 限定名；配置里会写成 `mars/<id>`）。显式设置时跳过拉取 |
 | `MARS_GRAY` | | 由入口脚本探测 | 灰度通道标记（`always`=灰度用户，空=非灰度）。非空时 LLM 与 MCP 请求都带 `mars_gray` 头；显式设置时跳过探测 |
@@ -140,7 +144,7 @@ make agent_check    # 本地门禁：gofmt + go vet + 全量测试（与 release
 
 ```bash
 MARS_AI_BIN=/bin/echo \
-MARS_GATEWAY_URL=http://mars-server.mars.svc:9000 \
+MARS_GATEWAY_URL=http://127.0.0.1:4000 \
 MARS_SESSION_TOKEN=tok MARS_MODEL=demo \
 HOME=$(mktemp -d) ./bin/mars-agent
 # 随后检查 $HOME/.config/opencode/opencode.json 与 skills/ 是否正确生成
@@ -165,7 +169,7 @@ MARS_AGENT_BIN=/bin/echo sh scripts/entrypoint.sh ok
 发布产物（与 chart 默认 `image.repository` 一致）：
 
 - `registry.cn-hangzhou.aliyuncs.com/duc-cnzj/mars-agent:<tag>`
-- Docker Hub `duccnzj/mars-agent:<tag>`
+- Docker Hub `docker.io/duccnzj/mars-agent:<tag>`
 
 每次发布同时更新 `vX.Y`（由 `vX.Y.Z` 派生）与浮动 `latest`。
 
@@ -271,7 +275,7 @@ helm install alice ./charts/mars-agent \
 
 | 值 | 说明 |
 |---|---|
-| `mars.gatewayURL` | mars 网关地址（默认 `http://mars-server.mars.svc:9000`） |
+| `mars.gatewayURL` | mars 网关地址（默认 `http://mars-server.mars.svc:9000`，**示例值，按实际 Service 覆盖**） |
 | `mars.token` | 会话令牌（短期 scoped JWT）；为空则安装直接失败（fail fast） |
 | `image.repository` | 镜像仓库（默认 `registry.cn-hangzhou.aliyuncs.com/duc-cnzj/mars-agent`） |
 | `image.tag` | 镜像 tag（`values.yaml` 默认 `latest`；置空则取 `Chart.appVersion`） |

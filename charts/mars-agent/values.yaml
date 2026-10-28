@@ -9,6 +9,7 @@
 # mars 网关注入的运行时契约。
 mars:
   # mars 网关地址（MCP + LLM 代理 + 运行时配置接口）。
+  # ⚠️ 默认值仅为示例：请按实际 mars Service 的命名空间与端口覆盖。
   gatewayURL: "http://mars-server.mars.svc:9000"
   # 短期 scoped JWT；为空则安装直接失败。经 Secret 注入，不落 Deployment 明文。
   token: ""

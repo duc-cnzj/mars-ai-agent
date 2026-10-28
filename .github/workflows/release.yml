@@ -1,7 +1,7 @@
 # CD：打 v* tag → 先跑测试门禁 → 构建双架构镜像 → 推送。
 # 镜像地址与 tag 口径与 mars 主仓保持一致：
 #   registry.cn-hangzhou.aliyuncs.com/duc-cnzj/mars-agent（chart 默认 image.repository）
-#   Docker Hub duccnzj/mars-agent
+#   Docker Hub docker.io/duccnzj/mars-agent
 #   tag：vX.Y.Z、vX.Y、latest（浮动）
 # 只接受 tag 触发：手动输入与 git 无关的版本号会让 semantic-version 派生错误的 vX.Y。
 name: build_docker

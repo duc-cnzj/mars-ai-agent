@@ -2,7 +2,7 @@
 vendor/
 # 构建产物
 /bin/
-# `go build .` 在仓库根直接产出的同名二进制（模块目录名 = agent）
-/agent
+# `go build .` 在仓库根直接产出的同名二进制（模块目录名 = mars-ai-agent）
+/mars-ai-agent
 # IDE 本地配置
 /.idea/
