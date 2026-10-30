@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,16 +57,36 @@ func doPost(ctx context.Context, client *http.Client, rawURL string) error {
 	return nil
 }
 
-// healthOK 实现 curl -f 的语义：状态码 < 400 视为成功。
+// healthOK 校验内核确实报告 healthy。
+//
+// 不能只看状态码：钉版 opencode 的 Web UI 对未知路径做 SPA 兜底并返回 200 HTML，
+// 只看 <400 会把「任意 HTTP 服务」（比如一个只会返回 200 的冒名进程）误判成内核
+// 就绪，K8s 探针、mai 的 attach 判断与 mcp-wait 的 server 等待都会失真。因此
+// 必须同时要求响应体是 {"healthy":true}。内核真正的健康路由见 healthPath。
 func healthOK(ctx context.Context, client *http.Client, rawURL string) error {
-	code, _, err := doGet(ctx, client, rawURL)
+	code, body, err := doGet(ctx, client, rawURL)
 	if err != nil {
 		return err
 	}
-	if code >= http.StatusBadRequest {
+	if code != http.StatusOK {
 		return fmt.Errorf("HTTP %d", code)
 	}
+	var st struct {
+		Healthy bool `json:"healthy"`
+	}
+	if err := json.Unmarshal(body, &st); err != nil || !st.Healthy {
+		return fmt.Errorf("HTTP %d 但响应不是 healthy JSON: %s", code, shortBody(body))
+	}
 	return nil
+}
+
+// shortBody 截断错误信息里的响应体，避免把整页 HTML 灌进探针 stderr。
+func shortBody(body []byte) string {
+	const max = 80
+	if len(body) > max {
+		return string(body[:max]) + "..."
+	}
+	return string(body)
 }
 
 // realSleep 是可被测试替换的等待实现：持锁等待，不响应上下文取消的调用方自行处理。

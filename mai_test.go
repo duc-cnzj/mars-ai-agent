@@ -222,6 +222,63 @@ func TestLocalHasSession(t *testing.T) {
 	}
 }
 
+// TestLocalHasSessionBeyondLegacyListCap 回归：opencode `session list` 不带 -n 时
+// 默认只返回最近 100 条，且排序是全局的。用户会话超过 100 条、当前目录的会话又较老时，
+// 旧实现传 `-n 100` 会把本目录的会话挤出结果集，mai 回退完整 TUI 时误判「无会话」
+// 而丢掉 -c。fake bin 按内核语义模拟截断：仅当请求上限覆盖到第 151 条时才吐出 /target。
+func TestLocalHasSessionBeyondLegacyListCap(t *testing.T) {
+	script := `#!/bin/sh
+n=100; prev=""
+for a in "$@"; do
+  [ "$prev" = "-n" ] && n="$a"
+  prev="$a"
+done
+i=0
+printf '['
+while [ "$i" -lt 150 ]; do
+  [ "$i" -gt 0 ] && printf ','
+  printf '{"directory":"/other"}'
+  i=$((i+1))
+done
+[ "$n" -ge 151 ] && printf ',{"directory":"/target"}'
+printf ']'
+`
+	bin := filepath.Join(t.TempDir(), "fake-opencode")
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("写 fake bin: %v", err)
+	}
+	if !localHasSession(bin, "/target") {
+		t.Error("当前目录的会话被全局排序挤出前 100 条时仍应命中，否则会丢掉 -c")
+	}
+}
+
+// TestLocalHasSessionSymlinkedDir 回归：内核按物理路径记录会话目录（如 macOS 上
+// /tmp → /private/tmp），而 os.Getwd 可能返回逻辑路径。cwd 为符号链接时必须仍判定
+// 为「有会话」，否则回退完整 TUI 会丢掉 -c，把用户的“继续上次会话”变成新开会话。
+func TestLocalHasSessionSymlinkedDir(t *testing.T) {
+	base := t.TempDir()
+	realDir := filepath.Join(base, "real")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	linkDir := filepath.Join(base, "link")
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Skipf("创建符号链接失败: %v", err)
+	}
+	realResolved, err := filepath.EvalSymlinks(realDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	bin := filepath.Join(base, "fake-opencode")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s' '[{\"directory\":%q}]'\n", realResolved)
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatalf("写 fake bin: %v", err)
+	}
+	if !localHasSession(bin, linkDir) {
+		t.Errorf("符号链接 cwd 应命中物理路径相同的会话")
+	}
+}
+
 // TestServerReady 验证 3 次重试语义。
 func TestServerReady(t *testing.T) {
 	shrinkMaiProbes(t)
@@ -231,7 +288,7 @@ func TestServerReady(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		writeHealthy(w)
 	}))
 	defer srv.Close()
 
@@ -253,6 +310,40 @@ func TestServerReady(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 3 {
 		t.Errorf("探测次数 = %d, want 3", got)
+	}
+}
+
+// TestServerReadyBusyKernel 回归：busy 内核的 /api/health 需要 1~3s（cli.healthProbeTimeout
+// 的注释即以此为准），单次探测预算若只有旧的 1s，「重试 3 次」也救不回来——server 明明
+// 活着却被判死，mai 退回完整 TUI 并丢掉 -c。这里用真实默认值（不 shrink）验证。
+func TestServerReadyBusyKernel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要真实等待约 1.5s")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(1500 * time.Millisecond) // 落在文档所述 1~3s 的区间内
+		writeHealthy(w)
+	}))
+	defer srv.Close()
+	if !serverReady(context.Background(), newHTTPClient(0), srv.URL) {
+		t.Fatal("忙但活着的 server 应判定为 ready")
+	}
+}
+
+// TestServerHasSessionBusyKernel 回归：/session 与 /api/health 跑在同一个忙碌内核上。
+// 预算若短于 /api/health（旧脚本 --max-time 2），server 有历史会话也会被判成「无会话」，
+// attach 丢掉 -c、给用户新开一个会话。这里用真实默认值验证 2.5s 的 /session 仍能判出会话。
+func TestServerHasSessionBusyKernel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要真实等待约 2.5s")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(2500 * time.Millisecond)
+		_, _ = w.Write([]byte(`[{"directory":"/proj"}]`))
+	}))
+	defer srv.Close()
+	if !serverHasSession(context.Background(), newHTTPClient(0), srv.URL, "/proj") {
+		t.Fatal("busy server 上的历史会话应判定为存在")
 	}
 }
 
@@ -283,8 +374,8 @@ func TestInteractiveOpencodeServerReady(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/health":
-			w.WriteHeader(http.StatusOK)
+		case healthPath:
+			writeHealthy(w)
 		case "/session":
 			_, _ = w.Write([]byte(`[]`))
 		default:
@@ -315,6 +406,10 @@ func TestInteractiveOpencodeServerReady(t *testing.T) {
 func TestInteractiveOpencodeRunAttach(t *testing.T) {
 	shrinkMaiProbes(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == healthPath {
+			writeHealthy(w)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -438,8 +533,8 @@ func TestInteractiveOpencodeUsesLogicalPWD(t *testing.T) {
 	gotDir := make(chan string, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/health":
-			w.WriteHeader(http.StatusOK)
+		case healthPath:
+			writeHealthy(w)
 		case "/session":
 			gotDir <- r.URL.Query().Get("directory")
 			_, _ = w.Write([]byte(`[]`))

@@ -177,10 +177,10 @@ func TestDispatchMaiPassthrough(t *testing.T) {
 // TestDispatchHealth 验证探针退出码 0/1。
 func TestDispatchHealth(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/health" {
-			t.Errorf("路径 = %s, want /health", r.URL.Path)
+		if r.URL.Path != healthPath {
+			t.Errorf("路径 = %s, want %s", r.URL.Path, healthPath)
 		}
-		w.WriteHeader(http.StatusOK)
+		writeHealthy(w)
 	}))
 	defer srv.Close()
 
@@ -405,13 +405,18 @@ func TestDispatchMaiErrors(t *testing.T) {
 	}
 }
 
-// mcpStatusServer 返回固定 MCP 状态的替身内核（/health 恒 200，/mcp 返回 body）。
+// writeHealthy 输出钉版 opencode /api/health 的最小合法响应体。
+func writeHealthy(w http.ResponseWriter) {
+	_, _ = w.Write([]byte(`{"healthy":true}`))
+}
+
+// mcpStatusServer 返回固定 MCP 状态的替身内核（/api/health 恒 healthy，/mcp 返回 body）。
 func mcpStatusServer(t *testing.T, body string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/health":
-			w.WriteHeader(http.StatusOK)
+		case healthPath:
+			writeHealthy(w)
 		case "/mcp":
 			_, _ = w.Write([]byte(body))
 		case "/mcp/" + mcpServerName + "/connect":

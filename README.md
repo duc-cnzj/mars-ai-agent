@@ -61,7 +61,7 @@ mars「AI 容器排查助手」的**沙箱侧组件**。每个用户独占一个
 | `MARS_GRAY` | | 由入口脚本探测 | 灰度通道标记（`always`=灰度用户，空=非灰度）。非空时 LLM 与 MCP 请求都带 `mars_gray` 头；显式设置时跳过探测 |
 | `MARS_AGENT_BACKEND` | | `opencode` | agent 内核选择（P0 仅 `opencode`；新增内核需在 `backendRegistry` 注册） |
 | `MARS_AI_BIN` | | `/usr/local/bin/opencode` | 内核二进制**路径覆盖**（只解决"二进制在哪"，不改变协议/配置形态） |
-| `MARS_LISTEN_ADDR` | | `0.0.0.0:4096` | 内核服务监听地址 |
+| `MARS_LISTEN_ADDR` | | `0.0.0.0:4096` | 内核服务监听地址。chart 固定为 `127.0.0.1:4096`（serve 无鉴权，只允许 Pod 内访问）；`docker run -p 4096:4096` 本地直连时保留默认值 |
 | `MARS_MCP_WAIT_TIMEOUT` | | `15` | `mai` 进入 TUI 前等待 MCP 就绪的上限（秒，0=不等待） |
 | `MARS_MCP_PREWARM_TIMEOUT` | | `120` | 容器启动后后台预热 MCP 的上限（秒，0=不预热） |
 | `HOME` | | `/workspace` | 配置与 skills 的落盘根（opencode 为 `$HOME/.config/opencode/`） |
@@ -88,7 +88,8 @@ Authorization: Bearer <MARS_SESSION_TOKEN>
 `isGray=true` 时入口脚本导出 `MARS_GRAY=always`，wrapper 把它写进 opencode 配置：
 LLM 供应商的 `options.headers` 与 MCP 服务的 `headers` 各带一份 `mars_gray: always`，
 由 nginx-ingress canary 把配置、LLM 代理与 MCP 请求固定路由到灰度通道。
-探测失败按非灰度处理（与 mars `/api/auth/info` 的 fail-open 口径一致），不阻断启动；
+探测遇到网络错误、5xx 与 429 会重试（与配置拉取同口径，最多 3 次），重试耗尽或其余 4xx
+按非灰度处理（与 mars `/api/auth/info` 的 fail-open 口径一致），不阻断启动；
 探测请求本身是唯一无法携带该头的 mars 请求（此时还不知道结果）。
 **灰度标记不进 JWT**（mars 每次读库），所以沙箱只在容器启动时感知：后台改标后，
 存量沙箱需重启（缩容后再次唤醒即可重新触发探测）才会切换通道。
@@ -100,7 +101,7 @@ opencode 只在 instance 创建时连一次 MCP，失败后状态会粘住（`st
 因此启动链路分两层保证（等待逻辑已收敛到 `mars-agent` 的 `WaitMCP`，按内核能力执行）：
 
 1. **容器启动预热**：入口脚本在 `exec` 前拉起后台 `mars-agent prewarm`，等内核
-   `/health` 可达后重连 MCP 并轮询到 `connected`（默认最多 120s，可重试覆盖
+   `/api/health` 返回 `{"healthy":true}` 后重连 MCP 并轮询到 `connected`（默认最多 120s，可重试覆盖
    网关尚未就绪的情况）。用户打开终端时通常已就绪。
 2. **进入 TUI 前兜底**：`mai` attach 前再等待一次（默认 15s），覆盖非
    `/workspace` 目录、常驻 server 重启、预热超时等场景。
@@ -150,10 +151,12 @@ HOME=$(mktemp -d) ./bin/mars-agent
 # 随后检查 $HOME/.config/opencode/opencode.json 与 skills/ 是否正确生成
 ```
 
-入口脚本可单独验证（`MARS_AGENT_BIN` 仅用于替换被 exec 的二进制）：
+入口脚本可单独验证（`MARS_AGENT_BIN` 仅用于替换被 exec 的二进制）。
+注意入口脚本会先拉取 `/api/ai/config` 注入模型，无真实网关时必须显式给 `MARS_MODEL`，
+否则重试 3 次后以 exit 1 退出、根本走不到 exec：
 
 ```bash
-MARS_GATEWAY_URL=http://127.0.0.1:4000 MARS_SESSION_TOKEN=tok \
+MARS_GATEWAY_URL=http://127.0.0.1:4000 MARS_SESSION_TOKEN=tok MARS_MODEL=demo \
 MARS_AGENT_BIN=/bin/echo sh scripts/entrypoint.sh ok
 ```
 
@@ -265,6 +268,11 @@ chart 位于 `charts/mars-agent/`，每个用户一个 release = 一个 Deployme
 不创建 Service）。用户经 mars 的项目终端（WebSocket → `pods/exec`）进入沙箱使用
 `mai`，浏览器不直连沙箱、不经 HTTP 反代；集群内调试走 `kubectl port-forward`（见 NOTES）。
 
+内核只绑 `127.0.0.1:4096`：`opencode serve` 默认无鉴权，绑 `0.0.0.0` 时同集群任意 Pod
+都能直连 `podIP:4096` 无凭证驱动 agent（发 prompt 会以用户令牌调用 mars MCP 工具）。
+回环绑定不影响两种访问方式——`pods/exec` 在容器内访问；`kubectl port-forward` 由
+kubelet 进入 Pod netns 连 loopback。
+
 ```bash
 helm install alice ./charts/mars-agent \
   --namespace mars-ai-alice --create-namespace \
@@ -291,8 +299,8 @@ helm install alice ./charts/mars-agent \
 > 因为沙箱能起来但所有回连都会 401。
 
 模型等运行时参数**不在 chart 里配置**：agent 启动时经 `GET <gatewayURL>/api/ai/config`
-从 mars 拉取（模型在 mars 的 `ai.model` 维护）。端口 4096、Recreate 更新策略、
-非 root（uid 65532）、根文件系统只读（可写面只有 `/workspace` 与 `/tmp`）、
+从 mars 拉取（模型在 mars 的 `ai.model` 维护）。端口 4096、只绑回环 127.0.0.1、
+Recreate 更新策略、非 root（uid 65532）、根文件系统只读（可写面只有 `/workspace` 与 `/tmp`）、
 探针、不挂载 ServiceAccount token 等为内置固定值。
 
 本地校验：
@@ -302,7 +310,8 @@ helm lint charts/mars-agent --set mars.token=demo-token
 helm template smoke charts/mars-agent --set mars.token=demo-token
 ```
 
-> 核对渲染结果：**不应出现 Service**（无反向代理入口），副本固定为 1，镜像来自默认仓库，且不注入 `MARS_MODEL`。
+> 核对渲染结果：**不应出现 Service**（无反向代理入口），副本固定为 1，镜像来自默认仓库，
+> `MARS_LISTEN_ADDR` 为 `127.0.0.1:4096`（不得回退成 `0.0.0.0`），且不注入 `MARS_MODEL`。
 
 ## 预置 opencode 二进制（构建镜像前必做）
 
@@ -329,12 +338,17 @@ helm template smoke charts/mars-agent --set mars.token=demo-token
   sessionID `dummy` 作为 TUI 初始路由发给服务端，服务端按 `ses` 前缀校验失败返回 500，
   TUI 启动页显示 `Unexpected server error. Check server logs for details.`（`mai`
   已先探测会话列表再决定是否带 `-c`；升级 opencode 后应回归这一场景）。
+  常驻 server 不可达时的本地探测走 `session list --format json`：该命令默认只返回最近
+  100 条且是全局排序，`mai` 显式放大扫描上限，避免本目录的老会话被其他目录的新会话
+  挤出后误判「无会话」。
 - `backend_opencode.go` 的 `serveArgs`（`opencode serve` 的 `--hostname` / `--port`）。
 - Skills 的发现路径（`$HOME/.config/opencode/skills/`）。
 - `tui/plugins/mars-logo.tsx` 使用的 `home_logo` 插槽与 TUI 插件 API（TUI 配置为 `tui.json`）。
 - `tui.go` 的 `ApplyTUIPrefs` 依赖 TUI 键值存储路径（`$XDG_STATE_HOME/opencode/kv.json`，
   默认 `$HOME/.local/state/opencode/kv.json`）与内置 tips 的开关键 `tips_hidden`。
-- `backend_opencode.go` 的 `Health` 依赖 opencode 的 `/health`；chart 探针已改为
+- `backend_opencode.go` 的 `Health` 依赖 opencode 的 `/api/health`（返回
+  `{"healthy":true}`）。注意 1.19.2 没有 `/health`：未知路径会被 Web UI 的 SPA
+  兜底成 200 HTML，所以探针必须校验路径与响应体，不能只看状态码。chart 探针已改为
   `mars-agent health`，路径变化只影响该适配器，不会让 chart 与具体内核耦合。
 
 这些点都集中在 `opencode` 适配器与配置文件内，升级只需改动对应单点。

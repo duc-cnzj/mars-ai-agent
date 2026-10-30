@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -125,44 +124,54 @@ func TestOpencodeLaunch(t *testing.T) {
 	}
 }
 
-// TestOpencodeHealth 验证 /health 的 2xx/3xx 视为成功、4xx/5xx 与不可达视为失败，
-// 且不跟随重定向（对齐 curl 无 -L 的语义）。
+// TestOpencodeHealth 验证健康检查打的是钉版内核真实存在的 healthPath，且要求
+// 响应体是 {"healthy":true}。
+//
+// 只判状态码是不够的：1.19.2 的 Web UI 对未知路径做 SPA 兜底并返回 200 HTML，
+// 任何返回 200 的进程都会被误判成内核就绪。这里把「200 + HTML」「200 + 空体」
+// 「200 + healthy:false」都算失败，并断言请求路径，防止回归到 /health。
 func TestOpencodeHealth(t *testing.T) {
 	tests := []struct {
-		name    string
-		code    int
-		wantErr bool
+		name        string
+		code        int
+		contentType string
+		body        string
+		wantErr     bool
 	}{
-		{"200", http.StatusOK, false},
-		{"302", http.StatusFound, false},
-		{"400", http.StatusBadRequest, true},
-		{"500", http.StatusInternalServerError, true},
+		{"healthy", http.StatusOK, "application/json", `{"healthy":true}`, false},
+		{"unhealthy", http.StatusOK, "application/json", `{"healthy":false}`, true},
+		{"spa fallback", http.StatusOK, "text/html", "<!doctype html><html></html>", true},
+		{"empty 200", http.StatusOK, "text/plain", "", true},
+		{"302", http.StatusFound, "text/plain", "", true},
+		{"400", http.StatusBadRequest, "application/json", `{"healthy":true}`, true},
+		{"500", http.StatusInternalServerError, "application/json", `{"healthy":true}`, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			var gotPath string
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				// 302 指向一个必然失败的地址：若客户端跟随重定向，Health 会失败，
-				// 从而真正验证 CheckRedirect 禁跟随，而不是只看最终状态码。
-				if r.URL.Path == "/redirected" {
-					w.WriteHeader(http.StatusInternalServerError)
-					return
-				}
+				gotPath = r.URL.Path
 				if tt.code == http.StatusFound {
 					w.Header().Set("Location", "/redirected")
 				}
+				w.Header().Set("Content-Type", tt.contentType)
 				w.WriteHeader(tt.code)
+				_, _ = w.Write([]byte(tt.body))
 			}))
 			defer srv.Close()
-			u, err := url.Parse(srv.URL)
+			_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
 			if err != nil {
-				t.Fatalf("parse url: %v", err)
+				t.Fatalf("split host:port: %v", err)
 			}
 
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			err = (opencodeBackend{}).Health(ctx, Env{ListenAddr: "0.0.0.0:" + u.Port()})
+			err = (opencodeBackend{}).Health(ctx, Env{ListenAddr: "0.0.0.0:" + port})
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Health() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if gotPath != healthPath {
+				t.Errorf("探测路径 = %q, want %q", gotPath, healthPath)
 			}
 		})
 	}

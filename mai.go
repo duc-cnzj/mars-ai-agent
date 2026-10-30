@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,8 +19,12 @@ import (
 var (
 	serverProbeAttempts = 3
 	serverProbeInterval = time.Second
-	serverProbeTimeout  = time.Second
-	sessionProbeTimeout = 2 * time.Second
+	// 单次探测预算必须覆盖 busy 内核的 /api/health 耗时（1~3s，见 cli.healthProbeTimeout）：
+	// 只有重试次数、不放宽单次超时，忙但活着的 server 仍会被判死，mai 退回完整 TUI 丢掉 -c。
+	serverProbeTimeout = healthProbeTimeout
+	// /session 也走同一个忙碌内核：预算短于 /api/health 时，server 明明有历史会话却会被
+	// 判成「无会话」，attach 丢掉 -c、新开一个会话（旧脚本 --max-time 2 的同款缺陷）。
+	sessionProbeTimeout = healthProbeTimeout
 	// getwd 可被测试替换：模拟目录被删除等 Getwd 失败场景。
 	getwd = os.Getwd
 )
@@ -119,12 +125,13 @@ func interactiveOpencode(env Env, args []string, stderr io.Writer) (Cmd, error) 
 	return planMai(args, st), nil
 }
 
-// serverReady 健康探测加短重试：server 活着但忙时，单次 1s 超时会把它误判为
-// 不可达，进而回退完整 TUI、起第二份 server。3 次 × 1s，最坏约 5s。
+// serverReady 健康探测加短重试：server 活着但忙时，单次超时过短会把它误判为
+// 不可达，进而回退完整 TUI、起第二份 server。3 次 × 3s，最坏约 11s；
+// 服务确实没起时 connection refused 立即返回，实际约 2s。
 func serverReady(ctx context.Context, client *http.Client, baseURL string) bool {
 	for i := 1; i <= serverProbeAttempts; i++ {
 		probeCtx, cancel := context.WithTimeout(ctx, serverProbeTimeout)
-		err := healthOK(probeCtx, client, baseURL+"/health")
+		err := healthOK(probeCtx, client, baseURL+healthPath)
 		cancel()
 		if err == nil {
 			return true
@@ -155,10 +162,22 @@ func serverHasSession(ctx context.Context, client *http.Client, baseURL, dir str
 	return len(sessions) > 0
 }
 
+// localSessionScanLimit 是本地会话探测的扫描上限。
+//
+// opencode `session list` 不带 -n 时默认只返回最近 100 条（-n 100 同值），且排序是
+// 全局的、不按目录过滤：会话较多的用户，当前目录的老会话会被其他目录的新会话挤出
+// 前 100，mai 便误判「无会话」，回退完整 TUI 时丢掉 -c、给用户新开一个会话。
+// 这里显式放大上限，让按目录过滤的判定能看到更久的历史（过滤本身见 localHasSession）。
+const localSessionScanLimit = 10000
+
 // localHasSession 在常驻 server 不可达时，用内核自己的会话列表探测当前目录。
 // 与旧脚本一致：丢弃 stderr、忽略退出码（非 0 时仍尝试解析 stdout）。
+//
+// ⚠️ 必须比较物理路径：内核按物理路径记录会话目录（如 macOS 上 /tmp → /private/tmp），
+// 而 os.Getwd 在 $PWD 与 "." 同 inode 时返回逻辑路径（符号链接不解析）。直接字符串比较
+// 会漏判，导致回退完整 TUI 时丢掉 -c、新开一个会话。
 func localHasSession(bin, dir string) bool {
-	cmd := exec.Command(bin, "session", "list", "-n", "100", "--format", "json")
+	cmd := exec.Command(bin, "session", "list", "-n", strconv.Itoa(localSessionScanLimit), "--format", "json")
 	cmd.Stderr = io.Discard
 	out, _ := cmd.Output()
 	if len(out) == 0 {
@@ -170,12 +189,23 @@ func localHasSession(bin, dir string) bool {
 	if json.Unmarshal(out, &sessions) != nil {
 		return false
 	}
+	want := physicalPath(dir)
 	for _, s := range sessions {
-		if s.Directory == dir {
+		if physicalPath(s.Directory) == want {
 			return true
 		}
 	}
 	return false
+}
+
+// physicalPath 把逻辑路径解析成物理路径（等价 shell 的 pwd -P）。
+// 路径已不存在等无法解析的情况退回原值：此时两侧都走原值比较，
+// 行为与改造前的字符串比较一致，不会更差。
+func physicalPath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return p
 }
 
 // mcpWaitTimeout 返回 `mai` 进入 TUI 前的 MCP 等待预算（秒）。

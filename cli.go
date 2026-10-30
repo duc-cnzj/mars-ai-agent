@@ -98,7 +98,7 @@ func runMai(args []string, stderr io.Writer, execFn func(Cmd) error) int {
 
 // healthProbeTimeout 取 chart 三个探针 timeoutSeconds 的最大值（startup 2s /
 // readiness 3s / liveness 3s）。旧的 httpGet 探针由 kubelet 计时，真实上限就是各自
-// 的 timeoutSeconds；改成 exec 后若这里只给 1s，busy 的内核（/health 1~3s）会被误判
+// 的 timeoutSeconds；改成 exec 后若这里只给 1s，busy 的内核（/api/health 1~3s）会被误判
 // 为不健康，连续失败还会触发 liveness 重启、丢掉用户会话。统一给满 3s，更短的探针
 // 仍由 kubelet 按自身 timeoutSeconds 截断。
 const healthProbeTimeout = 3 * time.Second

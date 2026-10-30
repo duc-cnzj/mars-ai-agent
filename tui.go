@@ -29,6 +29,12 @@ const tuiRoot = "tui"
 // tui.json 中插件路径是相对路径 ./plugins/mars-logo.tsx，因此 dst 必须是
 // $HOME/.config/opencode（与 tui.json 同级）。与 Skills 不同，这里保持可写：
 // 属于用户级 TUI 定制，不涉及执行权限收口。
+//
+// 必须可重复调用：$HOME 是 emptyDir，容器重启（崩溃、OOM、探针失败）不会清空它；
+// 用户或 agent 在沙箱里把 tui.json/插件目录改成只读后（chmod 是普通用户对自己文件的
+// 合法操作），第二次启动的 WriteFile 会 EACCES，Prepare 失败直接让 serve 起不来、
+// 容器 CrashLoop——一个纯装饰性的品牌插件不该有这种杀伤力。落盘前先恢复写权限，
+// 与 MaterializeSkills 的重启安全口径一致。
 func MaterializeTUI(dst string) error {
 	err := fs.WalkDir(tuiFS, tuiRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -40,10 +46,19 @@ func MaterializeTUI(dst string) error {
 		}
 		target := filepath.Join(dst, rel)
 		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			// 上次可能被改成只读目录：恢复可写才能覆盖其中的文件。
+			return os.Chmod(target, 0o755)
 		}
 		content, err := tuiFS.ReadFile(p)
 		if err != nil {
+			return err
+		}
+		// 同名文件上次可能被改成只读：先恢复可写再覆盖
+		// （不存在时 Chmod 返回 ErrNotExist，由随后的 WriteFile 创建）。
+		if err := os.Chmod(target, 0o644); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 		return os.WriteFile(target, content, 0o644)
@@ -56,11 +71,14 @@ func MaterializeTUI(dst string) error {
 
 // ApplyTUIPrefs 初始化 opencode TUI 的平台级偏好：
 //
-//   - 关闭首页内置 tips（tips_hidden，对应命令面板 System → Hide tips）；
+//   - 默认关闭首页内置 tips（tips_hidden，对应命令面板 System → Hide tips）；
 //   - 默认关闭 TUI 动画（animations_enabled，对应命令面板 Session →
 //     Disable animations）。opencode 的 spinner 约 57fps 持续重绘，即使空闲也能
 //     吃满一个核，在沙箱里表现为输入/滚动卡顿（opencode #3990 / #42657）。
-//     只在键不存在时写入 false，用户主动打开动画后不再覆盖。
+//
+// 两项都只在键不存在时写入默认值：opencode 读缺失键时分别回落 false/true，
+// 首次启动仍得到「隐藏 tips、关闭动画」；用户主动改回来（Show tips / Enable
+// animations）后必须保留，否则容器每次启动都会悄悄覆盖用户偏好。
 //
 // 落盘位置按 XDG 约定为 $XDG_STATE_HOME/opencode/kv.json，未设置
 // XDG_STATE_HOME 时为 $HOME/.local/state/opencode/kv.json。采用读-合并-写，
@@ -81,12 +99,18 @@ func ApplyTUIPrefs(home string) error {
 		if err := json.Unmarshal(raw, &kv); err != nil {
 			return fmt.Errorf("解析 %s 失败: %w", path, err)
 		}
+		// JSON null 会把 map 反序列化成 nil，之后任何写入都是
+		// "assignment to entry in nil map" panic。本函数是 best-effort 的，
+		// panic 会直接带走 PID 1（serve 起不来、容器 CrashLoop），必须挡在这里。
+		if kv == nil {
+			kv = map[string]any{}
+		}
 	case !errors.Is(err, fs.ErrNotExist):
 		return fmt.Errorf("读取 %s 失败: %w", path, err)
 	}
 
 	changed := false
-	if hidden, _ := kv["tips_hidden"].(bool); !hidden {
+	if _, ok := kv["tips_hidden"]; !ok {
 		kv["tips_hidden"] = true
 		changed = true
 	}

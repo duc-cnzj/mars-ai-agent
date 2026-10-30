@@ -122,8 +122,14 @@ func TestBuildConfig(t *testing.T) {
 	if p.Options.APIKey != tokenEnvPlaceholder {
 		t.Errorf("apiKey = %q, want 环境占位符（不得明文落盘）", p.Options.APIKey)
 	}
-	if _, ok := p.Models["m1"]; !ok {
-		t.Errorf("models 缺少 m1")
+	m, ok := p.Models["m1"]
+	if !ok {
+		t.Fatalf("models 缺少 m1")
+	}
+	// 必须声明 limit：否则 opencode 按默认 output=32000 发 max_tokens，
+	// DeepSeek 只接受 [1, 8192]，每一次 LLM 调用都会被上游 400 拒绝。
+	if m.Limit.Context != modelContextLimit || m.Limit.Output != modelOutputLimit {
+		t.Errorf("model limit = %+v, want context=%d output=%d", m.Limit, modelContextLimit, modelOutputLimit)
 	}
 	if cfg.Model != "mars/m1" {
 		t.Errorf("model = %q, want mars/m1", cfg.Model)
@@ -161,6 +167,11 @@ func TestBuildConfig(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"autoupdate":false`) {
 		t.Errorf("序列化结果缺少 autoupdate=false: %s", data)
+	}
+	// 落盘的 JSON 必须同时带 limit.context 与 limit.output（opencode 的 schema 要求二者成对），
+	// 且 output 不得超过 DeepSeek 的 8192 上限。
+	if !strings.Contains(string(data), `"context":128000`) || !strings.Contains(string(data), `"output":8192`) {
+		t.Errorf("序列化结果缺少模型 limit（context/output 必须成对出现）: %s", data)
 	}
 }
 

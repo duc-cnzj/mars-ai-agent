@@ -52,8 +52,14 @@ spec:
             - name: MARS_GATEWAY_URL
               value: {{ required "缺少 mars.gatewayURL（mars 网关地址）" .Values.mars.gatewayURL | quote }}
             # 由固定端口拼出，保证与探针使用同一端口。
+            #
+            # 只绑回环：opencode serve 默认无鉴权，绑 0.0.0.0 时同集群任意 Pod 直连
+            # podIP:PORT 即可无凭证驱动 agent（建会话、发 prompt，进而以用户令牌调用
+            # mars MCP 工具）。生产访问路径是 pods/exec（mars 项目终端），集群内调试走
+            # kubectl port-forward——kubelet 会进入 Pod netns 连 loopback，两种方式在
+            # 127.0.0.1 绑定下都照常可用；内置探针经 loopbackURL 同样落在 127.0.0.1。
             - name: MARS_LISTEN_ADDR
-              value: {{ printf "0.0.0.0:%s" (include "mars-agent.containerPort" .) | quote }}
+              value: {{ printf "127.0.0.1:%s" (include "mars-agent.containerPort" .) | quote }}
             - name: MARS_SESSION_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -72,7 +78,7 @@ spec:
             - name: tmp
               mountPath: /tmp
           # 探针调用 mars-agent health，由所选内核决定如何判断就绪：
-          # opencode 内部转发到自己的 /health。换内核时 chart 无需改动。
+          # opencode 适配器探测 /api/health 并要求 {"healthy":true}。换内核时 chart 无需改动。
           startupProbe:
             exec:
               command:

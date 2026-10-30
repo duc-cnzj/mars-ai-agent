@@ -12,7 +12,11 @@ mars-agent 已部署到命名空间 {{ .Release.Namespace }}。
 端点约定（opencode 内核）：
   /         opencode Web UI
   /doc      OpenAPI 文档
-  /health   内核健康检查；K8s 探针统一经 `mars-agent health` 间接调用
+  /api/health  内核健康检查（返回 {"healthy":true}）；K8s 探针统一经 `mars-agent health` 间接调用
+
+注意：内核只绑 127.0.0.1（serve 无鉴权，绑 0.0.0.0 会让同集群 Pod 直连 podIP 无凭证
+驱动 agent）。上面的 port-forward 仍可用——kubelet 在 Pod netns 内连 loopback；
+从 Pod 外部直接访问 podIP:{{ include "mars-agent.containerPort" . }} 会被拒绝，这是预期行为。
 
 运行时配置：
   agent 启动时经 GET {{ .Values.mars.gatewayURL }}/api/ai/config 拉取模型等参数，

@@ -135,8 +135,8 @@ func TestWaitMCPImmediateConnected(t *testing.T) {
 	gotDir := make(chan string, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/health":
-			w.WriteHeader(http.StatusOK)
+		case healthPath:
+			writeHealthy(w)
 		case "/mcp":
 			gotDir <- r.URL.Query().Get("directory")
 			_, _ = w.Write([]byte(`{"mars-tools":{"status":"connected"}}`))
@@ -165,14 +165,42 @@ func TestWaitMCPImmediateConnected(t *testing.T) {
 	}
 }
 
+// TestWaitMCPBusyHealth 回归：busy 内核的 /api/health 需要 1~3s，而 serverTimeout=0 时只有
+// 一次探测机会。旧的 1s 预算（沿用 shell --max-time 1）会把活着的 server 判成不可达，
+// mai 于是跳过 MCP 等待、带着 failed 状态的 MCP 进 TUI。这里用真实默认值验证。
+func TestWaitMCPBusyHealth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("需要真实等待约 1.5s")
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case healthPath:
+			time.Sleep(1500 * time.Millisecond) // 落在文档所述 1~3s 区间内
+			writeHealthy(w)
+		case "/mcp":
+			_, _ = w.Write([]byte(`{"mars-tools":{"status":"connected"}}`))
+		default:
+			t.Errorf("意外路径 %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	clock := newFakeClock(t)
+	err := waitMCPWith(context.Background(), srv.URL,
+		MCPWaitOptions{Dir: "/proj", Timeout: 15, ServerTimeout: 0}, clock.Now, clock.Sleep)
+	if err != nil {
+		t.Fatalf("waitMCPWith() error = %v, 忙但活着的 server 不应判为不可达", err)
+	}
+}
+
 // TestWaitMCPConnectThenConnected 验证先 failed 后重连成功，且 connect 请求带 directory。
 func TestWaitMCPConnectThenConnected(t *testing.T) {
 	var probes, connects int32
 	connectDir := make(chan string, 4)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/health":
-			w.WriteHeader(http.StatusOK)
+		case healthPath:
+			writeHealthy(w)
 		case "/mcp":
 			if atomic.AddInt32(&probes, 1) == 1 {
 				_, _ = w.Write([]byte(`{"mars-tools":{"status":"failed","error":"boom"}}`))
@@ -228,8 +256,8 @@ func TestWaitMCPServerUnreachable(t *testing.T) {
 func TestWaitMCPTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/health":
-			w.WriteHeader(http.StatusOK)
+		case healthPath:
+			writeHealthy(w)
 		case "/mcp":
 			_, _ = w.Write([]byte(`{"mars-tools":{"status":"failed","error":"boom"}}`))
 		case "/mcp/" + mcpServerName + "/connect":
@@ -263,8 +291,8 @@ func TestWaitMCPTimeout(t *testing.T) {
 func TestWaitMCPTimeoutZero(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/health":
-			w.WriteHeader(http.StatusOK)
+		case healthPath:
+			writeHealthy(w)
 		case "/mcp":
 			_, _ = w.Write([]byte(`{"mars-tools":{"status":"failed"}}`))
 		default:

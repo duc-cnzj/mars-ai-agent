@@ -68,9 +68,17 @@ func (opencodeBackend) Launch(env Env) (Cmd, error) {
 	return Cmd{Path: env.AIBin, Args: args}, nil
 }
 
-// Health 直达 opencode serve 的 /health。
+// healthPath 是钉版 opencode 的真实健康路由（`GET /doc` 的 OpenAPI 里
+// operationId=v2.health.get，返回 {"healthy":true}）。
+//
+// ⚠️ 不能用 /health：1.19.2 没有该路由，未知路径会被 Web UI 的 SPA 兜底成
+// 200 HTML——只看状态码的探针会把任何 HTTP 服务（含冒名进程）当成内核就绪。
+// 升级钉版内核后必须重新核对本路径，并确认返回体仍是 {"healthy":true}。
+const healthPath = "/api/health"
+
+// Health 直达 opencode serve 的真实健康接口。
 func (opencodeBackend) Health(ctx context.Context, env Env) error {
-	return healthOK(ctx, newHTTPClient(0), loopbackURL(env.ListenAddr)+"/health")
+	return healthOK(ctx, newHTTPClient(0), loopbackURL(env.ListenAddr)+healthPath)
 }
 
 func (opencodeBackend) WaitMCP(ctx context.Context, env Env, opt MCPWaitOptions) error {
@@ -94,8 +102,25 @@ func serveArgs(env Env) ([]string, error) {
 }
 
 // loopbackURL 把监听地址转成容器内回环 URL。
-// 保留旧脚本 `${addr##*:}` 的语义（取最后一个冒号之后的部分），不做地址合法性校验：
-// 非法地址会在探测时自然失败，而不是让 mai 直接报错退出。
+//
+// 通配/未指定 host（""、"0.0.0.0"、"::"）回落到 127.0.0.1；其余 host 原样保留
+// （localhost、::1 等），IPv6 字面量按 URL 规则加方括号。必须这样做：内核按
+// --hostname 绑定的地址决定可达性，只绑 ::1 时探 127.0.0.1 必然连不上，
+// 会让 health/mai/mcp-wait/prewarm 全部误判服务不可达。
+//
+// 非法地址沿用旧脚本语义（取最后一个冒号之后的部分），不做校验：
+// 在探测时自然失败，而不是让 mai 直接报错退出。
 func loopbackURL(listenAddr string) string {
-	return "http://127.0.0.1:" + listenAddr[strings.LastIndex(listenAddr, ":")+1:]
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return "http://127.0.0.1:" + listenAddr[strings.LastIndex(listenAddr, ":")+1:]
+	}
+	switch host {
+	case "", "0.0.0.0", "::":
+		host = "127.0.0.1"
+	}
+	if strings.ContainsRune(host, ':') {
+		host = "[" + host + "]"
+	}
+	return "http://" + host + ":" + port
 }

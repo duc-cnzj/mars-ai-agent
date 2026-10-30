@@ -126,13 +126,17 @@ func waitMCPWith(
 	// 1. 先等 server 可达。即使 serverTimeout=0 也先探测一次（旧脚本语义）。
 	// 注意：sleep 在 ctx 取消后会立即返回，必须显式检查 ctx，否则预算未耗尽时
 	// 会空转（realSleep 不推进 fake clock，真实时间里则表现为忙等）。
+	//
+	// 单次探测预算与 cli.healthProbeTimeout 对齐：busy 内核的 /api/health 要 1~3s，
+	// 固定 1s（旧脚本 --max-time 1）会把活着的 server 判成不可达。serverTimeout=0
+	// 时只有这一次机会——mai 会直接跳过 MCP 等待，带着未连接的 MCP 进 TUI。
 	healthDeadline := now().Add(time.Duration(opt.ServerTimeout) * time.Second)
 	for {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, time.Second)
-		err := healthOK(probeCtx, client, baseURL+"/health")
+		probeCtx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
+		err := healthOK(probeCtx, client, baseURL+healthPath)
 		cancel()
 		if err == nil {
 			break

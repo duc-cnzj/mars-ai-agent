@@ -52,6 +52,23 @@ jobs:
         with:
           version: v3.16.4
 
+      # README 发布步骤承诺「release 会校验 Chart.yaml 的 version / appVersion 与 tag 一致」，
+      # 但此前工作流从未读过 Chart.yaml：打 tag 时忘记提升版本不会失败。后果是
+      # appVersion 落后于真实镜像 tag——把 image.tag 置空（取 appVersion）的部署会拉到
+      # 不存在的镜像，而发布流水线全绿。
+      - name: 校验 Chart 版本与发布 tag 一致
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          chart="$(helm show chart charts/mars-agent)"
+          version="$(awk '$1 == "version:" { print $2 }' <<<"$chart")"
+          app_version="$(awk '$1 == "appVersion:" { print $2 }' <<<"$chart" | tr -d '"')"
+          if [ "$version" != "${tag#v}" ] || [ "$app_version" != "$tag" ]; then
+            echo "Chart.yaml 与发布 tag 不一致：tag=${tag} chart.version=${version} chart.appVersion=${app_version}" >&2
+            echo "请把 chart.version 提升为 ${tag#v}、appVersion 提升为 ${tag} 后再打 tag" >&2
+            exit 1
+          fi
+          echo "Chart 版本一致：chart.version=${version} appVersion=${app_version}"
+
       # chart 没有独立 CI，发布前必须渲染一遍：防止 Service 被加回、副本数漂移、
       # 镜像仓库写错，或把模型错误地固化进 manifest。
       - name: Helm 门禁（lint + 渲染断言）
@@ -74,7 +91,7 @@ jobs:
             echo "chart 不应注入 MARS_MODEL（模型由入口脚本从 mars 拉取）" >&2
             exit 1
           fi
-          # 探针必须走 mars-agent health（内核无关），不能再直打 opencode 的 /health。
+          # 探针必须走 mars-agent health（内核无关），不能在 chart 里直打内核健康路径。
           if grep -qE '^[[:space:]]*httpGet:' <<<"$out"; then
             echo "探针不应使用 httpGet，应统一调用 mars-agent health" >&2
             exit 1
@@ -90,6 +107,13 @@ jobs:
           fi
           if grep -qE '^[[:space:]]*- (serve|mai|mcp-wait|prewarm)$' <<<"$out"; then
             echo "探针不应执行 serve/mai/mcp-wait/prewarm" >&2
+            exit 1
+          fi
+          # 内核必须只绑回环：serve 无鉴权，绑 0.0.0.0 会让同集群任意 Pod 无凭证驱动 agent。
+          # exec / port-forward 都在 Pod netns 内连 loopback，不受影响。
+          if ! grep -qE 'name: MARS_LISTEN_ADDR' <<<"$out" \
+             || ! grep -qE 'value: "127\.0\.0\.1:[0-9]+"' <<<"$out"; then
+            echo "MARS_LISTEN_ADDR 必须是 127.0.0.1:<port>（不得绑 0.0.0.0）" >&2
             exit 1
           fi
           echo "helm 门禁通过"
@@ -124,6 +148,9 @@ jobs:
             exit 1
           fi
           docker run --rm --entrypoint /usr/local/bin/opencode mars-agent:smoke --version
+          # rg 必须在镜像里：缺失时 opencode 会在出网受限的沙箱里运行时下载未校验二进制，
+          # 导致 grep/glob 工具报 "ripgrep execution failed"（见 Dockerfile 同名注释）。
+          docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'command -v rg'
 
       - name: 启动 serve 并验证 health 探针
         run: |
@@ -133,7 +160,9 @@ jobs:
           trap 'docker rm -f smoke' EXIT
           ok=0
           for i in $(seq 1 60); do
-            if curl -sf -m 1 http://127.0.0.1:4096/health >/dev/null; then ok=1; break; fi
+            # 必须校验响应体：1.19.2 没有 /health，未知路径会被 Web UI 的 SPA 兜底成
+            # 200 HTML；唯一可信的就绪信号是 /api/health 返回 {"healthy":true}。
+            if curl -sf -m 1 http://127.0.0.1:4096/api/health | grep -q '"healthy":true'; then ok=1; break; fi
             sleep 1
           done
           if [ "$ok" != 1 ]; then

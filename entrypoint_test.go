@@ -81,6 +81,32 @@ func TestEntrypointFailsFastOnAuthError(t *testing.T) {
 	}
 }
 
+// TestEntrypointFailsFastOnMalformedJSON 200 + 非 JSON（网关被登录页/代理劫持的典型形态）时，
+// 应打印原始响应体并以 1 退出，而不是透出 jq 的 parse error 与其退出码 4。
+func TestEntrypointFailsFastOnMalformedJSON(t *testing.T) {
+	requireTooling(t, "sh", "curl", "jq")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/info":
+			_, _ = w.Write([]byte(`{"isGray":false}`))
+		case "/api/ai/config":
+			_, _ = w.Write([]byte(`<html>login</html>`))
+		default:
+			t.Errorf("意外请求路径 %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	_, stderr, code := runEntrypoint(t, srv.URL)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1; stderr=%s", code, stderr)
+	}
+	if !strings.Contains(stderr, "无法解析") || !strings.Contains(stderr, "<html>login</html>") {
+		t.Errorf("stderr 未带出原始响应体: %s", stderr)
+	}
+}
+
 // TestEntrypointGivesUpOnNetworkError 网络错误按上限重试后仍失败时，应退出非 0 并说明尝试次数。
 func TestEntrypointGivesUpOnNetworkError(t *testing.T) {
 	requireTooling(t, "sh", "curl", "jq")
@@ -179,6 +205,85 @@ func TestEntrypointGrayProbeFailOpen(t *testing.T) {
 	}
 	if got, _ := gotHeader.Load().(string); got != "" {
 		t.Errorf("探测失败时不应带 mars_gray，got %q", got)
+	}
+}
+
+// TestEntrypointGrayProbeRetriesTransientFailure 灰度标记只在启动时取一次：
+// 一次 5xx 抖动不应把灰度用户在整个 Pod 生命周期钉在非灰度通道，
+// 探测应与配置拉取同口径重试（网络错误/5xx/429）。
+func TestEntrypointGrayProbeRetriesTransientFailure(t *testing.T) {
+	requireTooling(t, "sh", "curl", "jq", "env")
+
+	var probes int32
+	var gotHeader atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/info":
+			if atomic.AddInt32(&probes, 1) < 3 {
+				http.Error(w, `{"error":"boom"}`, http.StatusInternalServerError)
+				return
+			}
+			_, _ = w.Write([]byte(`{"isGray":true}`))
+		case "/api/ai/config":
+			gotHeader.Store(r.Header.Get("mars_gray"))
+			_, _ = w.Write([]byte(`{"model":"demo-model"}`))
+		default:
+			t.Errorf("意外请求路径 %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	stdout, stderr, code := runEntrypoint(t, srv.URL, "MARS_AGENT_BIN=/usr/bin/env")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr)
+	}
+	if got := atomic.LoadInt32(&probes); got != 3 {
+		t.Errorf("灰度探测次数 = %d, want 3（5xx 应重试）", got)
+	}
+	if got, _ := gotHeader.Load().(string); got != "always" {
+		t.Errorf("配置请求 mars_gray = %q, want always", got)
+	}
+	if !strings.Contains(stdout, "MARS_GRAY=always") {
+		t.Errorf("wrapper 环境未注入 MARS_GRAY=always: %s", stdout)
+	}
+	if !strings.Contains(stderr, "第 2 次探测灰度通道失败") {
+		t.Errorf("stderr 未体现探测重试: %s", stderr)
+	}
+}
+
+// TestEntrypointGrayProbeFailsFastOnAuthError 探测接口返回非 429 4xx（如令牌过期）时，
+// 重试无意义：直接按非灰度继续，且仍不阻断启动。
+func TestEntrypointGrayProbeFailsFastOnAuthError(t *testing.T) {
+	requireTooling(t, "sh", "curl", "jq", "env")
+
+	var probes int32
+	var gotHeader atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/info":
+			atomic.AddInt32(&probes, 1)
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+		case "/api/ai/config":
+			gotHeader.Store(r.Header.Get("mars_gray"))
+			_, _ = w.Write([]byte(`{"model":"demo-model"}`))
+		default:
+			t.Errorf("意外请求路径 %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	_, stderr, code := runEntrypoint(t, srv.URL, "MARS_AGENT_BIN=/usr/bin/env")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0（探测失败应 fail-open）; stderr=%s", code, stderr)
+	}
+	if got := atomic.LoadInt32(&probes); got != 1 {
+		t.Errorf("灰度探测次数 = %d, want 1（401 不应重试）", got)
+	}
+	if got, _ := gotHeader.Load().(string); got != "" {
+		t.Errorf("探测失败时不应带 mars_gray，got %q", got)
+	}
+	if !strings.Contains(stderr, "401") {
+		t.Errorf("stderr 未带出状态码: %s", stderr)
 	}
 }
 

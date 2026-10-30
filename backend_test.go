@@ -48,6 +48,26 @@ func TestOpencodeCapabilities(t *testing.T) {
 	}
 }
 
+// TestLoopbackURL 验证监听地址到回环 URL 的映射：
+// 通配地址回落 127.0.0.1；显式 host（localhost/::1）必须保留，否则内核只绑 ::1 时
+// 探针必然连不上；非法地址保持旧脚本的宽松回落。
+func TestLoopbackURL(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"0.0.0.0:4096", "http://127.0.0.1:4096"},
+		{":4096", "http://127.0.0.1:4096"},
+		{"[::]:4096", "http://127.0.0.1:4096"},
+		{"127.0.0.1:4096", "http://127.0.0.1:4096"},
+		{"localhost:4096", "http://localhost:4096"},
+		{"[::1]:4096", "http://[::1]:4096"},
+		{"not-an-addr", "http://127.0.0.1:not-an-addr"},
+	}
+	for _, tt := range tests {
+		if got := loopbackURL(tt.in); got != tt.want {
+			t.Errorf("loopbackURL(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 // TestRegisteredBackends 验证注册表当前只有 opencode。
 func TestRegisteredBackends(t *testing.T) {
 	got := registeredBackends()

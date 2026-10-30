@@ -55,6 +55,18 @@ var writeTools = []string{"apply_project", "toggle_hibernate", "restart_pod", "e
 // grayHeaderName 是 nginx-ingress canary 读取的灰度路由头；值为 always 时固定路由到灰度通道。
 const grayHeaderName = "mars_gray"
 
+// modelContextLimit / modelOutputLimit 是写入 opencode 配置的模型上下文窗口与最大输出 token。
+//
+// ⚠️ 不声明 limit 时，opencode 会按内置默认 output=32000 发送 max_tokens；而 mars 的
+// 规范上游是 DeepSeek（见 mars config_example.yaml 的 ai.model=deepseek-chat），
+// 其 max_tokens 合法区间是 [1, 8192]，超出直接 HTTP 400，导致沙箱内每一次 LLM 调用都失败。
+// 因此这里显式声明为 DeepSeek 的上限（context 128k、output 8k）。
+// limit 的 context 与 output 必须同时给出：只给其一会让 opencode 启动时 schema 校验失败。
+const (
+	modelContextLimit = 128000
+	modelOutputLimit  = 8192
+)
+
 // Env 是 mars-agent 启动所需的全部环境变量（由沙箱 Pod manifest 注入）。
 type Env struct {
 	GatewayURL   string // MARS_GATEWAY_URL：mars 网关地址（提供 MCP 工具 + LLM 代理）
@@ -153,7 +165,15 @@ type ProviderOptions struct {
 
 // ProviderModel 描述一个可选模型。
 type ProviderModel struct {
-	Name string `json:"name"`
+	Name  string     `json:"name"`
+	Limit ModelLimit `json:"limit"`
+}
+
+// ModelLimit 声明模型的上下文窗口与最大输出 token。opencode 用它决定请求的 max_tokens
+// 与自动压缩阈值；缺省时回落到内置默认值，对 DeepSeek 这类限制 max_tokens 的上游不兼容。
+type ModelLimit struct {
+	Context int `json:"context"`
+	Output  int `json:"output"`
 }
 
 // MCPServer 描述一个 MCP 工具服务（此处为 mars 提供的远程工具服务）。
@@ -184,7 +204,10 @@ func BuildConfig(env Env) Config {
 					Headers: grayHeaders(env.Gray),
 				},
 				Models: map[string]ProviderModel{
-					env.Model: {Name: "Mars Pinned"},
+					env.Model: {
+						Name:  "Mars Pinned",
+						Limit: ModelLimit{Context: modelContextLimit, Output: modelOutputLimit},
+					},
 				},
 			},
 		},

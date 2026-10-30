@@ -25,16 +25,46 @@ set -eu
 # MCP 请求都会带上 mars_gray，由 nginx-ingress canary 固定路由到灰度通道。
 # MARS_GRAY 已显式设置时跳过探测（本地联调逃生舱）。
 # 探测失败按非灰度处理（与 mars /api/auth/info 的 fail-open 口径一致），不阻断启动。
+#
+# 灰度标记只能在启动时取一次：若一次网络抖动/5xx 就让探测失败，灰度用户会在整个 Pod
+# 生命周期被固定到非灰度通道（LLM/MCP 请求都不再带 mars_gray），后台改开关也救不回。
+# 因此与配置拉取同口径重试：网络错误、5xx、429 视为瞬时；其余 4xx 是鉴权问题，重试无意义。
 if [ -z "${MARS_GRAY:-}" ]; then
   info_url="${MARS_GATEWAY_URL%/}/api/auth/info"
   gray=""
-  if info="$(curl -sS --max-time 10 -H "Authorization: Bearer ${MARS_SESSION_TOKEN}" "$info_url")"; then
-    if [ "$(printf '%s' "$info" | jq -r '.isGray // false' 2>/dev/null)" = "true" ]; then
-      gray="always"
+  probe_attempt=1
+  while :; do
+    if info="$(curl -sS --max-time 10 -w '\n%{http_code}' \
+      -H "Authorization: Bearer ${MARS_SESSION_TOKEN}" "$info_url")"; then
+      status="$(printf '%s' "$info" | tail -n 1)"
+      body="$(printf '%s' "$info" | sed '$d')"
+      if [ "$status" = "200" ]; then
+        if [ "$(printf '%s' "$body" | jq -r '.isGray // false' 2>/dev/null)" = "true" ]; then
+          gray="always"
+        fi
+        break
+      fi
+      case "$status" in
+        4??)
+          if [ "$status" != "429" ]; then
+            echo "mars-agent: 灰度探测返回 ${status}，按非灰度启动: ${body}" >&2
+            break
+          fi
+          ;;
+      esac
+      last_err="灰度探测返回 ${status}: ${body}"
+    else
+      last_err="拉取灰度标记失败（网络错误）: ${info_url}"
     fi
-  else
-    echo "mars-agent: 探测灰度通道失败，按非灰度启动: ${info_url}" >&2
-  fi
+
+    if [ "$probe_attempt" -ge 3 ]; then
+      echo "mars-agent: 探测灰度通道失败，按非灰度启动: ${last_err}（已尝试 ${probe_attempt} 次）" >&2
+      break
+    fi
+    echo "mars-agent: 第 ${probe_attempt} 次探测灰度通道失败: ${last_err}；1 秒后重试" >&2
+    probe_attempt=$((probe_attempt + 1))
+    sleep 1
+  done
   MARS_GRAY="$gray"
   export MARS_GRAY
   echo "mars-agent: 灰度通道探测结果: ${MARS_GRAY:-非灰度}"
@@ -90,7 +120,13 @@ if [ -z "${MARS_MODEL:-}" ]; then
     sleep 1
   done
 
-  model="$(printf '%s' "$body" | jq -r '.model // empty')"
+  # jq 解析失败必须在这里转成明确诊断：网关被登录页/代理劫持时常返回 200 + 非 JSON，
+  # 原写法在 set -e 下会直接透出 jq 的 "parse error: Invalid literal" 并以 jq 的退出码
+  # （4）结束，既不打印原始响应体，退出码也与本文档口径（1）漂移。统一收口为 exit 1。
+  if ! model="$(printf '%s' "$body" | jq -r '.model // empty' 2>/dev/null)"; then
+    echo "mars-agent: mars 配置接口返回无法解析的 JSON: ${body}" >&2
+    exit 1
+  fi
   if [ -z "$model" ]; then
     echo "mars-agent: mars 配置接口未返回 model: ${body}" >&2
     exit 1
@@ -104,7 +140,7 @@ fi
 #
 # opencode 启动时会自己尝试连一次 MCP，但网关/网络尚未就绪时会失败且状态粘住，
 # 网关恢复后也不会自动重连。这里在容器启动后立刻异步预热并重试，用户打开终端
-# 时通常已就绪，避免每次进 TUI 都现场等待。预热会先等内核 server 的 /health，
+# 时通常已就绪，避免每次进 TUI 都现场等待。预热会先等内核 server 的 /api/health，
 # 因此可以安全地放在 exec 之前；后台任务不阻塞容器启动。
 #
 # 预热哪些内核、等多久由 mars-agent 按 MARS_AGENT_BACKEND / MARS_MCP_PREWARM_TIMEOUT

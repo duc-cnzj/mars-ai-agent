@@ -63,6 +63,11 @@ ARG APT_MIRROR=deb.debian.org
 
 # 只装排查/调试必需的少量工具（base 已有 coreutils/grep/sed/mawk）：
 # shell、进程、网络、TLS 证书、JSON、文本、压缩。--no-install-recommends + 清 apt 列表控体积。
+#
+# ripgrep 必须预装：opencode 的 grep/glob 工具依赖 rg，PATH 上没有时它会在首次使用时
+# 从 GitHub Releases **运行时下载**未校验的二进制到 $HOME/.cache/opencode/bin。
+# 在出网受限的沙箱里（恰好是 mars-agent 的默认运行环境）这会让搜索工具直接报
+# "ripgrep execution failed"，同时把一枚不可审计的可执行文件放进本应钉版的环境。
 RUN set -eux; \
     for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
         [ -f "$f" ] && sed -i "s|deb.debian.org|${APT_MIRROR}|g" "$f" || true; \
@@ -72,7 +77,7 @@ RUN set -eux; \
         bash ca-certificates curl wget \
         procps iproute2 netcat-openbsd dnsutils \
         jq less vim-tiny file lsof \
-        tar gzip unzip; \
+        tar gzip unzip ripgrep; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd -g 65532 nonroot; \
     useradd -u 65532 -g 65532 -M -d /workspace -s /bin/bash nonroot; \
