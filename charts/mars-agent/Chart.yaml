@@ -3,8 +3,8 @@ name: mars-agent
 description: mars「AI 容器排查助手」沙箱侧 agent（opencode serve + mars MCP/LLM 代理）
 type: application
 # 发版时同步提升：version 是 chart 版本，appVersion 是镜像默认 tag（二者都取 vX.Y.Z 口径）。
-version: 0.1.0
-appVersion: "v0.1.0"
+version: 0.0.13
+appVersion: "v0.0.13"
 keywords:
   - mars
   - ai
