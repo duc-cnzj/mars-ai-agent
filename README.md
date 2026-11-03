@@ -210,8 +210,11 @@ git tag v0.1.0 && git push origin v0.1.0   # 触发 release.yml
 
 ## 进容器终端
 
-运行时基座是 debian-slim + 少量常用排查工具（bash / ps / ip / ss / nc / dig / curl / wget /
-jq / less / vi / file / lsof / tar / unzip），非 root（uid 65532）。直接 exec 进去：
+运行时基座是 debian-slim + 少量常用排查工具（bash / ps / ip / ss / nc / dig / host /
+nslookup / curl / wget / jq / less / vi / file / lsof / tar / unzip / openssl / ripgrep），
+非 root（uid 65532）。镜像**不含包管理器**（apt/dpkg/perl 已移除，沙箱离线、镜像不可变）。
+`dig` 是 `kdig` 的兼容软链（knot-dnsutils），`host` / `nslookup` 由兼容层转发到 kdig；
+复杂 DNS 查询请直接用 `dig` / `kdig`。直接 exec 进去：
 
 ```bash
 docker run -d --name mars-agent -p 4096:4096 \
@@ -271,12 +274,14 @@ mai run "你好"             # 非交互跑一句：常驻 server 可达时用 -
 
 ### 镜像体积与内存权衡
 
-镜像默认用 UPX 5.0.2 压缩 opencode 内核（在写入运行层之前完成）：
+镜像默认用 UPX 5.0.2 压缩 opencode 内核与 mars-agent wrapper（均在写入运行层之前完成），
+并精简了工具层（`knot-dnsutils` 替代 bind9 系 `dnsutils`、移除构建期包管理器栈）：
 
-| | 未压缩 | UPX `-9` |
+| | 未压缩 | UPX `-9` + 精简工具层 |
 |---|---|---|
 | 内核二进制（arm64） | 185.5 MB | 56.3 MB（30.4%） |
-| 镜像（arm64） | ~369 MB | ~240 MB（-35%） |
+| wrapper（arm64） | 5.96 MB | 2.36 MB |
+| 镜像（arm64） | — | ~196 MB（旧版 ~244 MB，-20%） |
 | `serve` 进程 RSS | ~335 MB | ~415–440 MB（+80~145 MB） |
 
 UPX 是**运行时解压**，内存占用计入进程匿名页，不能像普通二进制那样被多进程共享。
@@ -286,6 +291,8 @@ UPX 是**运行时解压**，内存占用计入进程匿名页，不能像普通
 make agent_image AGENT_UPX=0          # 本地构建
 # release 的 buildx 同理：把 build-args 改成 OPENCODE_UPX=0
 ```
+
+> `AGENT_UPX=0` 只关闭**内核**压缩；wrapper 始终压缩（解压开销可忽略）。
 
 压缩顺序不能颠倒：镜像层是叠加的，必须先压好再 `COPY` 进运行层，否则原件层仍会占体积。
 

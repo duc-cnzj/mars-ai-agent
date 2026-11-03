@@ -5,9 +5,11 @@
 # vendor/opencode/opencode-linux-{amd64,arm64}，再由本文件 COPY 进来（构建上下文 = 仓库根）。
 # 生产环境应进一步以镜像 digest + cosign 验签分发。
 #
-# 内核在 COPY 进运行层之前用 UPX 压缩（约 30%），镜像从 ~369MB 降到 ~240MB。
-# 代价是运行时解压到匿名内存：serve 进程 RSS 约 +80~145MiB。内存限额紧的场景
-# 用 `--build-arg OPENCODE_UPX=0` 关闭压缩。
+# 内核与 wrapper 在 COPY 进运行层之前用 UPX 压缩（内核约 30%）。配合工具层精简
+# （knot-dnsutils 替代 bind9 系 dnsutils、移除构建期包管理器栈），arm64 镜像
+# 从 ~244MB 降到 ~196MB。内核压缩的代价是运行时解压到匿名内存：serve 进程 RSS
+# 约 +80~145MiB，内存限额紧的场景用 `--build-arg OPENCODE_UPX=0` 关闭内核压缩
+# （wrapper 仍压缩，其解压开销可忽略）。
 
 # 构建阶段固定跑在构建机架构（BUILDPLATFORM），由 Go 交叉编译到 TARGETARCH：
 # 多架构 buildx 下不会让 arm64 的整套 Go 工具链跑在 QEMU 模拟里，编译接近原生速度。
@@ -37,6 +39,9 @@ ARG TARGETARCH
 ARG OPENCODE_UPX=1
 RUN apk add --no-cache upx=5.0.2-r0
 COPY vendor/opencode/opencode-linux-${TARGETARCH} /in/opencode
+# wrapper 一并压缩（实测 5.96MB -> 2.35MB）。它不跟随 OPENCODE_UPX：
+# 该开关是为内核解压后的 RSS 权衡准备的，与静态 Go 二进制无关。
+COPY --from=builder /out/mars-agent /in/mars-agent
 RUN set -eux; \
     mkdir -p /out; \
     if [ "$OPENCODE_UPX" = "1" ]; then \
@@ -44,8 +49,9 @@ RUN set -eux; \
     else \
       cp /in/opencode /out/opencode; \
     fi; \
+    upx -9 --no-progress -o /out/mars-agent /in/mars-agent; \
     rm -rf /in; \
-    ls -l /out/opencode
+    ls -l /out
 
 # 运行时基座：debian-slim（glibc，与预置 opencode 二进制 ABI 一致）+ 一组精选常用排查工具。
 # 不用 alpine/musl——opencode 是 glibc 变体，musl 下跑不起来。
@@ -61,13 +67,23 @@ ARG TARGETARCH
 #   docker build --build-arg APT_MIRROR=mirrors.ustc.edu.cn ./agent
 ARG APT_MIRROR=deb.debian.org
 
+# host / nslookup 兼容层：knot-dnsutils 只提供 kdig/knsupdate，见脚本头注释。
+COPY scripts/dns-shim.sh /usr/local/bin/dns-shim
+
 # 只装排查/调试必需的少量工具（base 已有 coreutils/grep/sed/mawk）：
 # shell、进程、网络、TLS 证书、JSON、文本、压缩。--no-install-recommends + 清 apt 列表控体积。
+#
+# DNS 工具用 knot-dnsutils 而非 bind9 系 dnsutils：后者经 libxml2 硬依赖 libicu，
+# 单 libicudata 就 ~30MB，整条依赖链实测多出 ~40MiB。knot 的 kdig 兼容 dig 常用语法
+# （+short / -x 已验证），dig 直接软链到 kdig，host/nslookup 由上面的兼容层转发。
 #
 # ripgrep 必须预装：opencode 的 grep/glob 工具依赖 rg，PATH 上没有时它会在首次使用时
 # 从 GitHub Releases **运行时下载**未校验的二进制到 $HOME/.cache/opencode/bin。
 # 在出网受限的沙箱里（恰好是 mars-agent 的默认运行环境）这会让搜索工具直接报
 # "ripgrep execution failed"，同时把一枚不可审计的可执行文件放进本应钉版的环境。
+#
+# 镜像最终**不含包管理器**：沙箱默认离线、镜像不可变，apt/dpkg/perl/PAM/e2fsprogs
+# 只在构建期有用。移除实测回收 ~27MiB（dpkg 是 Essential 包，只能 --force-all 移除）。
 RUN set -eux; \
     for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
         [ -f "$f" ] && sed -i "s|deb.debian.org|${APT_MIRROR}|g" "$f" || true; \
@@ -75,13 +91,32 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         bash ca-certificates curl wget \
-        procps iproute2 netcat-openbsd dnsutils \
+        procps iproute2 netcat-openbsd knot-dnsutils \
         jq less vim-tiny file lsof \
         tar gzip unzip ripgrep; \
     rm -rf /var/lib/apt/lists/*; \
     groupadd -g 65532 nonroot; \
     useradd -u 65532 -g 65532 -M -d /workspace -s /bin/bash nonroot; \
-    install -d -o 65532 -g 65532 /workspace
+    install -d -o 65532 -g 65532 /workspace; \
+    ln -sf /usr/bin/kdig /usr/local/bin/dig; \
+    ln -sf /usr/local/bin/dns-shim /usr/local/bin/host; \
+    ln -sf /usr/local/bin/dns-shim /usr/local/bin/nslookup; \
+    chmod 0755 /usr/local/bin/dns-shim; \
+    DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all \
+        login passwd adduser libpam-modules libpam-runtime \
+        libsemanage2 libsemanage-common || true; \
+    DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all \
+        libaudit1 libdb5.3 e2fsprogs logsave libss2 libcom-err2 \
+        apt gpgv libapt-pkg6.0 perl-base dpkg || true; \
+    rm -rf /usr/share/doc /usr/share/man \
+        /var/lib/dpkg /var/lib/apt /var/cache/apt /var/log/apt /etc/apt; \
+    hash -r; \
+    for t in bash ps ss ip nc dig kdig host nslookup curl wget jq rg vi file lsof tar gzip unzip openssl getent; do \
+        command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }; \
+    done; \
+    if [ -e /usr/bin/apt-get ] || [ -e /usr/bin/dpkg ] || [ -e /usr/bin/perl ]; then \
+        echo "base package manager stack not fully removed" >&2; exit 1; \
+    fi
 
 # 交互式 shell 提示符：K8s Pod 名很长（agent-<uid>-mars-agent-<hash>-<pod>），
 # 默认 \h 会把提示符撑爆。固定成短名，只保留当前路径（不显示用户名）。
@@ -97,8 +132,8 @@ COPY --from=packer /out/opencode /usr/local/bin/opencode
 # 换内核时用户命令不变。全部内核逻辑在 mars-agent 内。
 COPY scripts/mai.sh /usr/local/bin/mai
 RUN chmod 0755 /usr/local/bin/mai
-# mars-agent wrapper（Skills 已 //go:embed 进二进制）
-COPY --from=builder /out/mars-agent /usr/local/bin/mars-agent
+# mars-agent wrapper（Skills 已 //go:embed 进二进制；同样在 packer 阶段压缩过）
+COPY --from=packer /out/mars-agent /usr/local/bin/mars-agent
 # 入口脚本：启动时用 gatewayURL + token 拉取 mars 配置（模型）注入环境，再交给 wrapper。
 # 依赖基础镜像已装的 curl 与 jq（见上方 apt 安装列表）。
 COPY scripts/entrypoint.sh /usr/local/bin/mars-agent-entrypoint

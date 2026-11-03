@@ -151,6 +151,20 @@ jobs:
           # rg 必须在镜像里：缺失时 opencode 会在出网受限的沙箱里运行时下载未校验二进制，
           # 导致 grep/glob 工具报 "ripgrep execution failed"（见 Dockerfile 同名注释）。
           docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'command -v rg'
+          # wrapper 也必须压缩（未压缩约 5.96MB，阈值 4MB）。
+          wsize="$(docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'stat -c %s /usr/local/bin/mars-agent')"
+          echo "wrapper: ${wsize} bytes"
+          if [ "$wsize" -ge 4000000 ]; then
+            echo "wrapper 未达到压缩预期（应 < 4MB）" >&2
+            exit 1
+          fi
+          # DNS 工具走 knot-dnsutils：dig 是 kdig 软链，host/nslookup 是兼容层。
+          docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'dig --version && command -v host nslookup'
+          # 精简策略：运行镜像不应再带包管理器，防止被无意改回。
+          if docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'command -v apt-get'; then
+            echo "运行镜像不应包含 apt-get" >&2
+            exit 1
+          fi
 
       - name: 启动 serve 并验证 health 探针
         run: |
