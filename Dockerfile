@@ -83,7 +83,9 @@ COPY scripts/dns-shim.sh /usr/local/bin/dns-shim
 # "ripgrep execution failed"，同时把一枚不可审计的可执行文件放进本应钉版的环境。
 #
 # 镜像最终**不含包管理器**：沙箱默认离线、镜像不可变，apt/dpkg/perl/PAM/e2fsprogs
-# 只在构建期有用。移除实测回收 ~27MiB（dpkg 是 Essential 包，只能 --force-all 移除）。
+# 只在构建期有用。移除实测回收 ~25MiB（dpkg 是 Essential 包，只能 --force-all 移除）。
+# 注意 libcom-err2 / libdb5.3 / libaudit1 必须保留：curl+ss+lsof、iproute2、
+# util-linux-extra+PAM 仍在链接它们。下方用 ldd 全量审计兜底，防止再次误删。
 RUN set -eux; \
     for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
         [ -f "$f" ] && sed -i "s|deb.debian.org|${APT_MIRROR}|g" "$f" || true; \
@@ -105,8 +107,10 @@ RUN set -eux; \
     DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all \
         login passwd adduser libpam-modules libpam-runtime \
         libsemanage2 libsemanage-common || true; \
+    # 只移除没有存活依赖者的包：libcom-err2 / libdb5.3 / libaudit1 仍被
+    # curl+ss+lsof / iproute2 / util-linux-extra+PAM 链接，删了会造成运行时缺库。
     DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all \
-        libaudit1 libdb5.3 e2fsprogs logsave libss2 libcom-err2 \
+        e2fsprogs logsave libss2 \
         apt gpgv libapt-pkg6.0 perl-base dpkg || true; \
     rm -rf /usr/share/doc /usr/share/man \
         /var/lib/dpkg /var/lib/apt /var/cache/apt /var/log/apt /etc/apt; \
@@ -114,6 +118,18 @@ RUN set -eux; \
     for t in bash ps ss ip nc dig kdig host nslookup curl wget jq rg vi file lsof tar gzip unzip openssl getent; do \
         command -v "$t" >/dev/null || { echo "missing tool: $t" >&2; exit 1; }; \
     done; \
+    for d in /usr/bin /usr/sbin /usr/local/bin; do \
+        for f in "$d"/*; do \
+            [ -e "$f" ] || continue; \
+            if ldd "$f" 2>/dev/null | grep -q "not found"; then \
+                echo "broken dynamic link: $f" >&2; \
+                ldd "$f" | grep "not found" >&2; \
+                exit 1; \
+            fi; \
+        done; \
+    done; \
+    curl --version >/dev/null; \
+    ss -V >/dev/null; \
     if [ -e /usr/bin/apt-get ] || [ -e /usr/bin/dpkg ] || [ -e /usr/bin/perl ]; then \
         echo "base package manager stack not fully removed" >&2; exit 1; \
     fi

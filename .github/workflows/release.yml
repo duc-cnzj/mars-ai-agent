@@ -160,6 +160,9 @@ jobs:
           fi
           # DNS 工具走 knot-dnsutils：dig 是 kdig 软链，host/nslookup 是兼容层。
           docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'dig --version && command -v host nslookup'
+          # 动态链接完整性：曾因误删 libcom-err2 让 curl/ss/lsof 缺库（镜像构建能过、
+          # 运行才炸）。这里显式执行一次，确保关键工具真的能加载起来。
+          docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'curl --version >/dev/null && ss -V >/dev/null && lsof -v >/dev/null'
           # 精简策略：运行镜像不应再带包管理器，防止被无意改回。
           if docker run --rm --entrypoint /bin/sh mars-agent:smoke -c 'command -v apt-get'; then
             echo "运行镜像不应包含 apt-get" >&2
