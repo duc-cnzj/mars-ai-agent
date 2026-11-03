@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -55,6 +56,37 @@ func doPost(ctx context.Context, client *http.Client, rawURL string) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxProbeBody))
 	return nil
+}
+
+// doJSON 发起 POST 并返回状态码与响应体；payload 为 nil 时不带请求体。
+// 与 doPost 的分工：需要读取响应（创建会话、提交问题）时用本函数，
+// 只关心请求是否送达的探测（MCP connect）仍用 doPost。
+func doJSON(ctx context.Context, client *http.Client, rawURL string, payload any) (int, []byte, error) {
+	var body io.Reader
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			return 0, nil, err
+		}
+		body = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, body)
+	if err != nil {
+		return 0, nil, err
+	}
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxProbeBody))
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, respBody, nil
 }
 
 // healthOK 校验内核确实报告 healthy。
