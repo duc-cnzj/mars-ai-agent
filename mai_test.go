@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1549,6 +1550,46 @@ func TestSessionPrepRetriesLeaseAfterDialError(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Errorf("会话解析调用 %d 次, want 2（拨号失败后补做一次）", got)
+	}
+}
+
+// TestSessionPrepHealthDownDoesNotWaitForSessionLock 回归：降级路径不能被目录锁拖住。
+// lockSessionCreation 的 Flock 不响应 ctx 取消，而会话解析在健康探测完成前就已并发
+// 启动；若另一进程正持有目录锁，等待该 goroutine 会让「常驻服务不可用→降级完整 TUI」
+// 这条兜底路径一直卡到对方释放锁（旧实现在降级前根本不会碰这把锁）。
+func TestSessionPrepHealthDownDoesNotWaitForSessionLock(t *testing.T) {
+	shrinkMaiProbes(t)
+	t.Setenv("MARS_MCP_WAIT_TIMEOUT", "0")
+	dir := t.TempDir()
+
+	// 模拟另一个 mai 长时间持有该目录的创建锁。
+	f, err := os.OpenFile(sessionLockPath(dir), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatalf("打开目录锁失败: %v", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		_ = f.Close()
+		t.Fatalf("持有目录锁失败: %v", err)
+	}
+	go func() {
+		time.Sleep(5 * time.Second)
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}()
+
+	baseURL := "http://127.0.0.1:" + closedPort(t)
+	started := time.Now()
+	_, ready := startSessionPrep(context.Background(), newHTTPClient(0), baseURL, dir, io.Discard,
+		func(rctx context.Context) (string, error) {
+			return ensurePromptSessionLease(rctx, newHTTPClient(0), baseURL, dir, nil)
+		})
+	elapsed := time.Since(started)
+
+	if ready {
+		t.Fatal("健康探测失败时 ready 应为 false")
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("降级路径被目录锁阻塞了 %v，want <2s", elapsed)
 	}
 }
 

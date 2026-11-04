@@ -846,9 +846,13 @@ func startSessionPrep(
 	}
 	cancelMCP()
 	cancelLease()
-	// 等两条链路真正退出再返回，避免与调用方的 stderr 输出并发。
+	// 只等 MCP 链路退出：它会写 stderr，必须与调用方的告警输出串行。
+	//
+	// 会话链路不写任何输出；而 lockSessionCreation 的 Flock 不响应 ctx 取消，
+	// 若另一进程正持有目录锁，在这里等它会把「健康探测失败→降级」这条兜底路径
+	// 拖住（旧实现根本不会在降级前碰这把锁）。取消后直接返回：该 goroutine 后续
+	// 的 HTTP 调用会因 ctx 已取消快速失败，进程随后 exec 时线程一并消失。
 	<-p.mcpDone
-	<-p.leaseDone
 	return p, false
 }
 
