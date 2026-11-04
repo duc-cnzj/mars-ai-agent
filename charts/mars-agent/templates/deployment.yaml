@@ -1,3 +1,4 @@
+{{- $p := (default dict .Values.workspace).persistence | default dict }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -108,9 +109,15 @@ spec:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         # /workspace 是 HOME：opencode 配置、只读 skills 与会话数据（~/.local/share/opencode）都落在这里。
-        # 不设 sizeLimit：会话数据随使用增长，限额只会换来 emptyDir 超限后的 Pod 驱逐。
+        # 默认 emptyDir：容器重启数据仍在，Pod 重建/漂移后丢失；开启持久化后改挂 PVC。
+        # emptyDir 不设 sizeLimit：会话数据随使用增长，限额只会换来超限后的 Pod 驱逐。
         - name: workspace
+          {{- if $p.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $p.existingClaim | default (include "mars-agent.fullname" .) }}
+          {{- else }}
           emptyDir: {}
+          {{- end }}
         - name: tmp
           emptyDir: {}
       {{- with .Values.nodeSelector }}

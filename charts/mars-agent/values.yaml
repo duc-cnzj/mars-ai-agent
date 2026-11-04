@@ -34,3 +34,22 @@ nodeSelector: {}
 tolerations: []
 
 affinity: {}
+
+# /workspace 持久化（HOME：opencode 配置、skills、会话数据）。
+# 默认 emptyDir：容器重启数据仍在，Pod 重建或调度到其他节点后丢失。
+workspace:
+  persistence:
+    enabled: false
+    # 复用已有 PVC：非空时不再创建 PVC，直接挂载该名称。
+    existingClaim: ""
+    # 新建 PVC 的容量（启用且未复用已有 PVC 时生效）。
+    size: 10Gi
+    accessModes:
+      - ReadWriteOnce
+    # 为空时使用集群默认 StorageClass。
+    storageClassName: ""
+    # 卸载 release 时保留 PVC，避免数据随 helm uninstall 删除。
+    # 保留后同名 release 重新安装会因 PVC 已存在而失败，需改用 existingClaim 显式挂载。
+    keep: false
+    # 追加到 PVC 的注解。
+    annotations: {}

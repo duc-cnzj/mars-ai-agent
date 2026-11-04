@@ -328,7 +328,19 @@ helm install alice ./charts/mars-agent \
 | `imagePullSecrets` | 私有仓库拉取凭据（可选） |
 | `podAnnotations` | 追加到 Pod 的注解 |
 | `resources` | 资源请求/限制 |
+| `workspace.persistence.enabled` | 是否把 `/workspace`（HOME：配置、skills、会话数据）挂到 PVC；默认 `false`（emptyDir） |
+| `workspace.persistence.existingClaim` | 复用已有 PVC；非空时不再创建 PVC |
+| `workspace.persistence.size` | 新建 PVC 容量（默认 `10Gi`） |
+| `workspace.persistence.accessModes` | 新建 PVC 访问模式（默认 `ReadWriteOnce`） |
+| `workspace.persistence.storageClassName` | 新建 PVC 的 StorageClass；空值用集群默认 |
+| `workspace.persistence.keep` | 卸载 release 时保留 PVC；保留后重新安装需改用 `existingClaim` |
 | `nodeSelector` / `tolerations` / `affinity` | 调度约束 |
+
+> `/workspace` 默认是 emptyDir：容器重启数据保留，**Pod 重建或调度到其他节点后丢失**。
+> 需要跨 Pod 生命周期保留（会话、改动过的文件）时开启 `workspace.persistence.enabled`。
+> 新建 PVC 的属主由 Pod 的 `fsGroup: 65532` 修正；NFS/hostPath 等不实现 fsGroup 的存储
+> 插件需自行保证 uid 65532 可写。Deployment 已是 `Recreate` 策略，与 RWO 卷匹配，
+> 不会出现新旧 Pod 同时占用同一卷导致更新卡住。
 
 > 由 mars 平台托管时（AI Agent 仓库部署到 `mars-agent` 空间），仓库 values 中的
 > `mars.token` **必须**写成 `"<.UserToken>"`：部署流水线会在每次部署/唤醒时替换为

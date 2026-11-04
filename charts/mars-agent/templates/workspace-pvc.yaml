@@ -1,0 +1,28 @@
+{{- $p := (default dict .Values.workspace).persistence | default dict }}
+{{- if and $p.enabled (not $p.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "mars-agent.fullname" . }}
+  labels:
+    {{- include "mars-agent.labels" . | nindent 4 }}
+  {{- if or $p.keep $p.annotations }}
+  annotations:
+    {{- if $p.keep }}
+    # 卸载 release 时保留数据卷；重新安装需改用 existingClaim 显式挂载。
+    helm.sh/resource-policy: keep
+    {{- end }}
+    {{- with $p.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  accessModes:
+    {{- toYaml $p.accessModes | nindent 4 }}
+  {{- if $p.storageClassName }}
+  storageClassName: {{ $p.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $p.size }}
+{{- end }}
