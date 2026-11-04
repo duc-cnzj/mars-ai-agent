@@ -130,26 +130,44 @@ func waitMCPWith(
 	// 单次探测预算与 cli.healthProbeTimeout 对齐：busy 内核的 /api/health 要 1~3s，
 	// 固定 1s（旧脚本 --max-time 1）会把活着的 server 判成不可达。serverTimeout=0
 	// 时只有这一次机会——mai 会直接跳过 MCP 等待，带着未连接的 MCP 进 TUI。
-	healthDeadline := now().Add(time.Duration(opt.ServerTimeout) * time.Second)
-	for {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
+	//
+	// ServerVerified 为 true 时调用方（mai）刚做过同样的健康探测，这里直接跳过，
+	// 避免在热路径上重复支付 1~3s；后续首个 MCP 探测若发生传输错误，再由下面的
+	// 归因逻辑补探一次，保证降级行为不变。
+	if !opt.ServerVerified {
+		healthDeadline := now().Add(time.Duration(opt.ServerTimeout) * time.Second)
+		for {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
+			err := healthOK(probeCtx, client, baseURL+healthPath)
+			cancel()
+			if err == nil {
+				break
+			}
+			if !now().Before(healthDeadline) {
+				fmt.Fprintf(logw, "mars-mcp-wait: opencode server 未在 %ds 内就绪: %s\n", opt.ServerTimeout, baseURL)
+				return errMCPServerUnreachable
+			}
+			sleep(ctx, time.Second)
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
-		err := healthOK(probeCtx, client, baseURL+healthPath)
-		cancel()
-		if err == nil {
-			break
-		}
-		if !now().Before(healthDeadline) {
-			fmt.Fprintf(logw, "mars-mcp-wait: opencode server 未在 %ds 内就绪: %s\n", opt.ServerTimeout, baseURL)
-			return errMCPServerUnreachable
-		}
-		sleep(ctx, time.Second)
 	}
 
 	// 2. 首次探测 MCP 状态。查询 /mcp 本身会按 directory 创建 instance。
-	status, errMsg := probeMCP(ctx, client, baseURL, opt.Dir)
+	status, errMsg, probeErr := probeMCP(ctx, client, baseURL, opt.Dir)
+	// 跳过 health 后，首个 MCP 探测的传输错误需要归因：server 恰好在这两个调用
+	// 之间挂掉时，补一次 health 探测并快速返回不可达，而不是盲等整个 MCP 预算。
+	// health 正常则说明只是瞬态错误，继续走原等待逻辑。
+	if probeErr != nil && opt.ServerVerified {
+		probeCtx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
+		herr := healthOK(probeCtx, client, baseURL+healthPath)
+		cancel()
+		if herr != nil {
+			fmt.Fprintf(logw, "mars-mcp-wait: opencode server 不可达: %s\n", baseURL)
+			return errMCPServerUnreachable
+		}
+	}
 	if status == "connected" {
 		return nil
 	}
@@ -178,7 +196,7 @@ func waitMCPWith(
 		}.Encode())
 		cancel()
 
-		status, errMsg = probeMCP(ctx, client, baseURL, opt.Dir)
+		status, errMsg, _ = probeMCP(ctx, client, baseURL, opt.Dir)
 		if status == "connected" {
 			return nil
 		}
@@ -197,22 +215,23 @@ func waitMCPWith(
 }
 
 // probeMCP 查询 MCP 服务状态。与旧脚本一致：不带 curl -f 语义（非 2xx 也解析 body），
-// 传输错误或非法 JSON 都按「状态未知」处理。
-func probeMCP(ctx context.Context, client *http.Client, baseURL, dir string) (status, errMsg string) {
+// 非 2xx / 非法 JSON 都按「状态未知」处理（返回空 status，不返回 error）。
+// 只有传输错误才返回 err，供调用方判断 server 是否已不可达。
+func probeMCP(ctx context.Context, client *http.Client, baseURL, dir string) (status, errMsg string, err error) {
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	_, body, err := doGet(probeCtx, client, baseURL+"/mcp?"+url.Values{
 		"directory": {dir},
 	}.Encode())
 	if err != nil {
-		return "", ""
+		return "", "", err
 	}
 	var servers map[string]mcpStatus
 	if json.Unmarshal(body, &servers) != nil {
-		return "", ""
+		return "", "", nil
 	}
 	s := servers[mcpServerName]
-	return s.Status, s.Error
+	return s.Status, s.Error, nil
 }
 
 func statusOrUnknown(status string) string {

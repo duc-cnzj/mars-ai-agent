@@ -54,10 +54,14 @@ type Cmd struct {
 
 // MCPWaitOptions 是 MCP 就绪等待参数。Log 为 nil 时不输出进度/告警。
 type MCPWaitOptions struct {
-	Dir           string
-	Timeout       int
-	ServerTimeout int
-	Log           io.Writer
+	Dir     string
+	Timeout int
+	// ServerVerified 表示调用方刚刚通过健康探测确认内核 server 可达。
+	// 置 true 时跳过 waitMCP 自身的 server 探测，避免 mai 链路重复等待
+	// busy 内核的 /api/health（单次可达 1~3s）。独立 mcp-wait 子命令保持 false。
+	ServerVerified bool
+	ServerTimeout  int
+	Log            io.Writer
 }
 
 // backendRegistry 是 shim/内核注册表。P0 只有 opencode。

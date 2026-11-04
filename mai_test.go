@@ -1310,6 +1310,341 @@ func TestInteractiveOpencodeBind(t *testing.T) {
 	}
 }
 
+// TestInteractiveOpencodeBindSkipsDuplicateHealth 验证 mai 链路复用 serverReady 的结果：
+// 绑定前只有一次 health 探测，MCP 等待不再重复支付 busy 内核的 /api/health。
+func TestInteractiveOpencodeBindSkipsDuplicateHealth(t *testing.T) {
+	shrinkMaiProbes(t)
+	t.Setenv("MARS_MCP_WAIT_TIMEOUT", "5")
+	var healths, mcps int32
+	gotText := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == healthPath:
+			atomic.AddInt32(&healths, 1)
+			writeHealthy(w)
+		case r.URL.Path == "/mcp":
+			atomic.AddInt32(&mcps, 1)
+			_, _ = w.Write([]byte(`{"mars-tools":{"status":"connected"}}`))
+		case r.URL.Path == "/session" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[{"id":"ses_existing"}]`))
+		case r.URL.Path == "/session/ses_existing/message" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[]`))
+		case r.URL.Path == "/session/ses_existing/message" && r.Method == http.MethodPost:
+			var payload struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if len(payload.Parts) == 1 {
+				gotText <- payload.Parts[0].Text
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("意外请求 %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	port := serverPort(t, srv.URL)
+
+	if _, err := (opencodeBackend{}).Interactive(Env{
+		AIBin:      "/bin/echo",
+		ListenAddr: "0.0.0.0:" + port,
+	}, []string{"--bind", "uat/demo"}, io.Discard); err != nil {
+		t.Fatalf("Interactive() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&healths); got != 1 {
+		t.Errorf("health 探测 %d 次, want 1（serverReady 一次，waitMCP 应复用）", got)
+	}
+	if got := atomic.LoadInt32(&mcps); got != 1 {
+		t.Errorf("MCP 探测 %d 次, want 1", got)
+	}
+	_ = recvString(t, gotText)
+}
+
+// TestInteractiveOpencodeBindNewSessionSkipsDedupe 验证新建会话时不去读历史消息做去重：
+// 新会话历史必为空，直接写入绑定上下文，省一次 GET 往返。
+func TestInteractiveOpencodeBindNewSessionSkipsDedupe(t *testing.T) {
+	shrinkMaiProbes(t)
+	t.Setenv("MARS_MCP_WAIT_TIMEOUT", "0")
+	dir, _ := os.Getwd()
+	var posted int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == healthPath:
+			writeHealthy(w)
+		case r.URL.Path == "/session" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[]`))
+		case r.URL.Path == "/session" && r.Method == http.MethodPost:
+			_, _ = w.Write([]byte(`{"id":"ses_new"}`))
+		case r.URL.Path == "/session/ses_new/message" && r.Method == http.MethodGet:
+			t.Errorf("新建会话不应查询历史消息（去重可跳过），实际 GET %s", r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.URL.Path == "/session/ses_new/message" && r.Method == http.MethodPost:
+			atomic.AddInt32(&posted, 1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("意外请求 %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	port := serverPort(t, srv.URL)
+
+	cmd, err := (opencodeBackend{}).Interactive(Env{
+		AIBin:      "/bin/echo",
+		ListenAddr: "0.0.0.0:" + port,
+	}, []string{"--bind", "uat/demo"}, io.Discard)
+	if err != nil {
+		t.Fatalf("Interactive() error = %v", err)
+	}
+	want := []string{"attach", "--dir", dir, "-s", "ses_new", "http://127.0.0.1:" + port}
+	if strings.Join(cmd.Args, " ") != strings.Join(want, " ") {
+		t.Errorf("Args = %v, want %v", cmd.Args, want)
+	}
+	if got := atomic.LoadInt32(&posted); got != 1 {
+		t.Errorf("绑定消息写入 %d 次, want 1", got)
+	}
+}
+
+// TestInteractiveOpencodeBindOverlapsHealthAndResolve 验证健康探测与会话解析并发：
+// 服务端在收到 /session 之前不返回 health，串行实现会超时降级，只有并发才能通过。
+func TestInteractiveOpencodeBindOverlapsHealthAndResolve(t *testing.T) {
+	shrinkMaiProbes(t)
+	serverProbeTimeout = 2 * time.Second
+	t.Setenv("MARS_MCP_WAIT_TIMEOUT", "0")
+	dir, _ := os.Getwd()
+	sessionSeen := make(chan struct{})
+	var seenOnce sync.Once
+	var healths, overlapped int32
+	gotText := make(chan string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == healthPath:
+			atomic.AddInt32(&healths, 1)
+			select {
+			case <-sessionSeen:
+				atomic.StoreInt32(&overlapped, 1)
+			case <-time.After(time.Second):
+			}
+			writeHealthy(w)
+		case r.URL.Path == "/session" && r.Method == http.MethodGet:
+			seenOnce.Do(func() { close(sessionSeen) })
+			_, _ = w.Write([]byte(`[{"id":"ses_existing"}]`))
+		case r.URL.Path == "/session/ses_existing/message" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[]`))
+		case r.URL.Path == "/session/ses_existing/message" && r.Method == http.MethodPost:
+			var payload struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if len(payload.Parts) == 1 {
+				gotText <- payload.Parts[0].Text
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("意外请求 %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	port := serverPort(t, srv.URL)
+
+	cmd, err := (opencodeBackend{}).Interactive(Env{
+		AIBin:      "/bin/echo",
+		ListenAddr: "0.0.0.0:" + port,
+	}, []string{"--bind", "uat/demo"}, io.Discard)
+	if err != nil {
+		t.Fatalf("Interactive() error = %v", err)
+	}
+	want := []string{"attach", "--dir", dir, "-s", "ses_existing", "http://127.0.0.1:" + port}
+	if strings.Join(cmd.Args, " ") != strings.Join(want, " ") {
+		t.Errorf("Args = %v, want %v", cmd.Args, want)
+	}
+	if got := atomic.LoadInt32(&overlapped); got != 1 {
+		t.Error("health 探测未与会话解析并发（串行实现会在这里超时降级）")
+	}
+	if got := atomic.LoadInt32(&healths); got != 1 {
+		t.Errorf("health 探测 %d 次, want 1", got)
+	}
+	_ = recvString(t, gotText)
+}
+
+// TestInteractiveOpencodeBindHealthDownFallsBack 验证健康探测失败时照旧降级，
+// 不因并发预热而卡住或误用会话结果。
+func TestInteractiveOpencodeBindHealthDownFallsBack(t *testing.T) {
+	shrinkMaiProbes(t)
+	t.Setenv("MARS_MCP_WAIT_TIMEOUT", "0")
+	var healths int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == healthPath:
+			atomic.AddInt32(&healths, 1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case r.URL.Path == "/session" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[{"id":"ses_existing"}]`))
+		case r.URL.Path == "/session/ses_existing/message":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("意外请求 %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	port := serverPort(t, srv.URL)
+
+	var stderr strings.Builder
+	cmd, err := (opencodeBackend{}).Interactive(Env{
+		AIBin:      "/bin/echo",
+		ListenAddr: "0.0.0.0:" + port,
+	}, []string{"--bind", "uat/demo"}, &stderr)
+	if err != nil {
+		t.Fatalf("Interactive() error = %v", err)
+	}
+	if got, want := strings.Join(cmd.Args, " "), "--auto"; got != want {
+		t.Errorf("Args = %q, want %q（健康探测失败应降级为完整 TUI）", got, want)
+	}
+	if !strings.Contains(stderr.String(), "常驻服务未就绪") {
+		t.Errorf("stderr = %q, want 包含「常驻服务未就绪」", stderr.String())
+	}
+	if got := atomic.LoadInt32(&healths); got != int32(serverProbeAttempts) {
+		t.Errorf("health 探测 %d 次, want %d", got, serverProbeAttempts)
+	}
+}
+
+// TestSessionPrepRetriesLeaseAfterDialError 验证并发预热的会话请求在 server 尚未
+// 监听时拨号失败后，会在健康探测通过后补做一次，不把「还没起好」当成绑定失败。
+func TestSessionPrepRetriesLeaseAfterDialError(t *testing.T) {
+	shrinkMaiProbes(t)
+	t.Setenv("MARS_MCP_WAIT_TIMEOUT", "0")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == healthPath {
+			writeHealthy(w)
+			return
+		}
+		t.Errorf("意外请求 %s %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	var calls int32
+	prep, ready := startSessionPrep(context.Background(), newHTTPClient(0), srv.URL, "/proj", io.Discard,
+		func(context.Context) (string, error) {
+			if atomic.AddInt32(&calls, 1) == 1 {
+				return "", &url.Error{Op: "Get", URL: srv.URL + "/session", Err: &net.OpError{
+					Op: "dial", Net: "tcp", Err: errors.New("connection refused"),
+				}}
+			}
+			return "ses_ok", nil
+		})
+	if !ready {
+		t.Fatal("serverReady() = false, want true")
+	}
+	id, err := prep.wait()
+	if err != nil || id != "ses_ok" {
+		t.Fatalf("wait() = %q, %v, want ses_ok, nil", id, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("会话解析调用 %d 次, want 2（拨号失败后补做一次）", got)
+	}
+}
+
+// TestIsDialError 验证只把「连接尚未建立」视为可补做错误。
+func TestIsDialError(t *testing.T) {
+	dial := &url.Error{Op: "Get", URL: "http://127.0.0.1:1/session", Err: &net.OpError{
+		Op: "dial", Net: "tcp", Err: errors.New("connection refused"),
+	}}
+	if !isDialError(dial) {
+		t.Error("拨号错误未被识别")
+	}
+	read := &url.Error{Op: "Get", URL: "http://127.0.0.1:1/session", Err: &net.OpError{
+		Op: "read", Net: "tcp", Err: errors.New("connection reset"),
+	}}
+	if isDialError(read) {
+		t.Error("读错误不应触发补做")
+	}
+	if isDialError(context.DeadlineExceeded) {
+		t.Error("超时不应触发补做")
+	}
+}
+
+// TestInteractiveOpencodeBindServerStartsLate 验证 server 晚于 mai 启动时，
+// 会话解析与 MCP 等待都会在健康探测通过后补做，最终仍 attach 正确会话。
+func TestInteractiveOpencodeBindServerStartsLate(t *testing.T) {
+	shrinkMaiProbes(t)
+	serverProbeAttempts = 50
+	serverProbeInterval = 10 * time.Millisecond
+	serverProbeTimeout = 100 * time.Millisecond
+	t.Setenv("MARS_MCP_WAIT_TIMEOUT", "2")
+	dir, _ := os.Getwd()
+	port := closedPort(t)
+	var posted int32
+	gotText := make(chan string, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == healthPath:
+			writeHealthy(w)
+		case r.URL.Path == "/mcp":
+			_, _ = w.Write([]byte(`{"mars-tools":{"status":"connected"}}`))
+		case r.URL.Path == "/session" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[{"id":"ses_existing"}]`))
+		case r.URL.Path == "/session/ses_existing/message" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[]`))
+		case r.URL.Path == "/session/ses_existing/message" && r.Method == http.MethodPost:
+			atomic.AddInt32(&posted, 1)
+			var payload struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if len(payload.Parts) == 1 {
+				gotText <- payload.Parts[0].Text
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("意外请求 %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srvCh := make(chan *http.Server, 1)
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		l, err := net.Listen("tcp", "127.0.0.1:"+port)
+		if err != nil {
+			srvCh <- nil
+			return
+		}
+		s := &http.Server{Handler: handler}
+		go func() { _ = s.Serve(l) }()
+		srvCh <- s
+	}()
+	defer func() {
+		if s := <-srvCh; s != nil {
+			_ = s.Close()
+		}
+	}()
+
+	cmd, err := (opencodeBackend{}).Interactive(Env{
+		AIBin:      "/bin/echo",
+		ListenAddr: "0.0.0.0:" + port,
+	}, []string{"--bind", "uat/demo"}, io.Discard)
+	if err != nil {
+		t.Fatalf("Interactive() error = %v", err)
+	}
+	want := []string{"attach", "--dir", dir, "-s", "ses_existing", "http://127.0.0.1:" + port}
+	if strings.Join(cmd.Args, " ") != strings.Join(want, " ") {
+		t.Errorf("Args = %v, want %v", cmd.Args, want)
+	}
+	if got := atomic.LoadInt32(&posted); got != 1 {
+		t.Errorf("绑定消息写入 %d 次, want 1", got)
+	}
+	_ = recvString(t, gotText)
+}
+
 // TestInteractiveOpencodeBindWithPrompt 验证绑定与首条问题共存：先注入绑定，再投递问题。
 func TestInteractiveOpencodeBindWithPrompt(t *testing.T) {
 	shrinkMaiProbes(t)

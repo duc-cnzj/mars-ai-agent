@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -320,17 +321,20 @@ func ensurePromptSession(ctx context.Context, client *http.Client, baseURL, dir 
 // check-then-act，若放在锁外，并发双击卡片时两个 mai 会同时读到空历史、各写一条同样
 // 的绑定，把重复上下文堆进会话。setup 为 nil 时退化为单纯解析会话。
 //
+// setup 的 created 参数表示会话是否本次新建：新建会话历史必为空，调用方可以跳过
+// 「查重」直接写入，省掉一次 GET messages 往返。setup 为 nil 时退化为单纯解析会话。
+//
 // 错误语义：返回 ("", err) 表示会话解析失败，调用方应降级为普通 TUI；返回 (id, err)
 // 表示会话已就绪但 setup 注入失败，调用方仍可 attach 该会话。
-func ensurePromptSessionLease(ctx context.Context, client *http.Client, baseURL, dir string, setup func(context.Context, string) error) (string, error) {
+func ensurePromptSessionLease(ctx context.Context, client *http.Client, baseURL, dir string, setup func(context.Context, string, bool) error) (string, error) {
 	release := lockSessionCreation(dir)
 	defer release()
-	id, err := ensurePromptSessionLocked(ctx, client, baseURL, dir)
+	id, created, err := ensurePromptSessionLocked(ctx, client, baseURL, dir)
 	if err != nil {
 		return "", err
 	}
 	if setup != nil {
-		if err := setup(ctx, id); err != nil {
+		if err := setup(ctx, id, created); err != nil {
 			return id, err
 		}
 	}
@@ -338,14 +342,14 @@ func ensurePromptSessionLease(ctx context.Context, client *http.Client, baseURL,
 }
 
 // ensurePromptSessionLocked 是 ensurePromptSession 的锁内版本：调用方必须已持有
-// lockSessionCreation(dir)。
-func ensurePromptSessionLocked(ctx context.Context, client *http.Client, baseURL, dir string) (string, error) {
-	id, err := latestSessionID(ctx, client, baseURL, dir)
+// lockSessionCreation(dir)。created 为 true 表示本次新建了会话（历史必为空）。
+func ensurePromptSessionLocked(ctx context.Context, client *http.Client, baseURL, dir string) (id string, created bool, err error) {
+	id, err = latestSessionID(ctx, client, baseURL, dir)
 	if err != nil {
-		return "", fmt.Errorf("查询最近会话失败: %w", err)
+		return "", false, fmt.Errorf("查询最近会话失败: %w", err)
 	}
 	if id != "" {
-		return id, nil
+		return id, false, nil
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, sessionProbeTimeout)
 	defer cancel()
@@ -353,18 +357,18 @@ func ensurePromptSessionLocked(ctx context.Context, client *http.Client, baseURL
 		"directory": {dir},
 	}.Encode(), nil)
 	if err != nil {
-		return "", fmt.Errorf("创建会话失败: %w", err)
+		return "", false, fmt.Errorf("创建会话失败: %w", err)
 	}
 	if code < 200 || code >= 300 {
-		return "", fmt.Errorf("创建会话失败: HTTP %d: %s", code, shortBody(body))
+		return "", false, fmt.Errorf("创建会话失败: HTTP %d: %s", code, shortBody(body))
 	}
 	var session struct {
 		ID string `json:"id"`
 	}
 	if json.Unmarshal(body, &session) != nil || session.ID == "" {
-		return "", fmt.Errorf("创建会话响应缺少 id: %s", shortBody(body))
+		return "", false, fmt.Errorf("创建会话响应缺少 id: %s", shortBody(body))
 	}
-	return session.ID, nil
+	return session.ID, true, nil
 }
 
 // withLatestSession 在目录锁内解析当前目录最近根会话并执行 setup 注入。
@@ -444,7 +448,14 @@ func bindingContextText(bindings []string) string {
 // 都会调用 mai --bind，重复注入会把同一段绑定堆满历史、挤占模型上下文。
 func sendBindingContext(ctx context.Context, client *http.Client, baseURL, dir, sessionID string, bindings []string) error {
 	return sendSyntheticContextOnce(ctx, client, baseURL, dir, sessionID,
-		bindingContextText(bindings), "注入绑定上下文失败")
+		bindingContextText(bindings), "注入绑定上下文失败", false)
+}
+
+// sendBindingContextFresh 用于本次新建的会话：历史必为空，跳过去重查询直接写入，
+// 省掉一次 GET messages 往返。调用方必须确认会话是本次在同一把目录锁内新建的。
+func sendBindingContextFresh(ctx context.Context, client *http.Client, baseURL, dir, sessionID string, bindings []string) error {
+	return sendSyntheticContextOnce(ctx, client, baseURL, dir, sessionID,
+		bindingContextText(bindings), "注入绑定上下文失败", true)
 }
 
 // sendUnbindContext 把「当前没有绑定任何范围」作为隐藏上下文注入会话。
@@ -454,16 +465,23 @@ func sendBindingContext(ctx context.Context, client *http.Client, baseURL, dir, 
 // 最近一条 synthetic 上下文已经是「无绑定」时同样跳过，避免重复写入。
 func sendUnbindContext(ctx context.Context, client *http.Client, baseURL, dir, sessionID string) error {
 	return sendSyntheticContextOnce(ctx, client, baseURL, dir, sessionID,
-		unbindContextText, "清除绑定上下文失败")
+		unbindContextText, "清除绑定上下文失败", false)
+}
+
+// sendUnbindContextFresh 用于本次新建的会话：历史必为空，跳过去重查询直接写入。
+func sendUnbindContextFresh(ctx context.Context, client *http.Client, baseURL, dir, sessionID string) error {
+	return sendSyntheticContextOnce(ctx, client, baseURL, dir, sessionID,
+		unbindContextText, "清除绑定上下文失败", true)
 }
 
 // sendSyntheticContextOnce 把 text 作为隐藏上下文写入会话；最近一条 synthetic 文本
 // 已经是 text 时直接跳过，避免重复注入把同一段上下文堆满历史。
 //
 // failMsg 只用于失败告警前缀（绑定/清空两类语义各自保留中文表述），写入规则只有
-// 这一份，避免两个调用方各改一半。
-func sendSyntheticContextOnce(ctx context.Context, client *http.Client, baseURL, dir, sessionID, text, failMsg string) error {
-	if lastSyntheticText(ctx, client, baseURL, dir, sessionID) == text {
+// 这一份，避免两个调用方各改一半。skipDedupe 用于「会话刚新建、历史必为空」的
+// 场景：省掉一次只读查询，写入结果完全一致。
+func sendSyntheticContextOnce(ctx context.Context, client *http.Client, baseURL, dir, sessionID, text, failMsg string, skipDedupe bool) error {
+	if !skipDedupe && lastSyntheticText(ctx, client, baseURL, dir, sessionID) == text {
 		return nil
 	}
 	if err := postSyntheticContext(ctx, client, baseURL, dir, sessionID, text); err != nil {
@@ -613,7 +631,7 @@ func interactiveOpencode(env Env, args []string, stderr io.Writer) (Cmd, error) 
 
 	// 进入 TUI 前确保 MCP 已就绪：connect API 只发起连接、不等待完成，
 	// 发一次请求就 attach 会让 TUI 在 MCP 未就绪时启动。超时只告警、不阻断。
-	waitMCPBeforeTUI(ctx, st.URL, st.Dir, stderr)
+	_ = waitMCPBeforeTUI(ctx, st.URL, st.Dir, stderr)
 	st.ServerHasSession = serverHasSession(ctx, client, st.URL, dir)
 	return planMai(args, st), nil
 }
@@ -639,8 +657,28 @@ func attachCmd(bin, dir, sessionID, baseURL string) Cmd {
 // 用户进 TUI 就能看到问题已发送、回复在流式输出，全程不依赖终端按键时序。
 // 投递失败只降级为普通 attach（问题需手动输入），不让用户进不去沙箱。
 func planPromptCommand(ctx context.Context, env Env, client *http.Client, st maiState, prompt string, bindings []string, unbind bool, stderr io.Writer) Cmd {
-	st.ServerReady = serverReady(ctx, client, st.URL)
-	if !st.ServerReady {
+	// 先绑定、后提问：同一段对话里，问题默认落到未明确指定时使用的范围。
+	// 绑定注入与「查重」放在与建会话同一把目录锁内，避免并发重复写入。
+	// 健康探测、MCP 等待、会话解析三者互不依赖，并发执行；投递问题与 attach 仍在其后。
+	prep, ready := startSessionPrep(ctx, client, st.URL, st.Dir, stderr, func(rctx context.Context) (string, error) {
+		return ensurePromptSessionLease(rctx, client, st.URL, st.Dir, func(sctx context.Context, sessionID string, created bool) error {
+			switch {
+			case len(bindings) > 0:
+				if created {
+					return sendBindingContextFresh(sctx, client, st.URL, st.Dir, sessionID, bindings)
+				}
+				return sendBindingContext(sctx, client, st.URL, st.Dir, sessionID, bindings)
+			case unbind:
+				// 没有绑定但显式要求清空：覆盖会话历史里的旧绑定，避免问题仍落到旧范围。
+				if created {
+					return sendUnbindContextFresh(sctx, client, st.URL, st.Dir, sessionID)
+				}
+				return sendUnbindContext(sctx, client, st.URL, st.Dir, sessionID)
+			}
+			return nil
+		})
+	})
+	if !ready {
 		switch {
 		case len(bindings) > 0:
 			fmt.Fprintf(stderr, "mars-agent: 常驻服务未就绪，无法绑定 %s；问题照常发送\n", strings.Join(bindings, "、"))
@@ -649,19 +687,7 @@ func planPromptCommand(ctx context.Context, env Env, client *http.Client, st mai
 		}
 		return planPromptFallback(env.AIBin, prompt, localHasSession(env.AIBin, st.Dir))
 	}
-	waitMCPBeforeTUI(ctx, st.URL, st.Dir, stderr)
-	// 先绑定、后提问：同一段对话里，问题默认落到未明确指定时使用的范围。
-	// 绑定注入与「查重」放在与建会话同一把目录锁内，避免并发重复写入。
-	sessionID, err := ensurePromptSessionLease(ctx, client, st.URL, st.Dir, func(ctx context.Context, sessionID string) error {
-		switch {
-		case len(bindings) > 0:
-			return sendBindingContext(ctx, client, st.URL, st.Dir, sessionID, bindings)
-		case unbind:
-			// 没有绑定但显式要求清空：覆盖会话历史里的旧绑定，避免问题仍落到旧范围。
-			return sendUnbindContext(ctx, client, st.URL, st.Dir, sessionID)
-		}
-		return nil
-	})
+	sessionID, err := prep.wait()
 	if sessionID == "" {
 		fmt.Fprintf(stderr, "mars-agent: %v；进入普通 TUI，请手动输入问题\n", err)
 		return plainAttachCmd(ctx, client, st)
@@ -685,16 +711,20 @@ func planPromptCommand(ctx context.Context, env Env, client *http.Client, st mai
 // 降级为普通 attach，不让用户进不去沙箱。
 func planBindCommand(ctx context.Context, env Env, client *http.Client, st maiState, bindings []string, stderr io.Writer) Cmd {
 	joined := strings.Join(bindings, "、")
-	st.ServerReady = serverReady(ctx, client, st.URL)
-	if !st.ServerReady {
+	prep, ready := startSessionPrep(ctx, client, st.URL, st.Dir, stderr, func(rctx context.Context) (string, error) {
+		return ensurePromptSessionLease(rctx, client, st.URL, st.Dir, func(sctx context.Context, sessionID string, created bool) error {
+			if created {
+				return sendBindingContextFresh(sctx, client, st.URL, st.Dir, sessionID, bindings)
+			}
+			return sendBindingContext(sctx, client, st.URL, st.Dir, sessionID, bindings)
+		})
+	})
+	if !ready {
 		fmt.Fprintf(stderr, "mars-agent: 常驻服务未就绪，无法绑定 %s；进入普通 TUI\n", joined)
 		st.LocalHasSession = localHasSession(env.AIBin, st.Dir)
 		return planMai(nil, st)
 	}
-	waitMCPBeforeTUI(ctx, st.URL, st.Dir, stderr)
-	sessionID, err := ensurePromptSessionLease(ctx, client, st.URL, st.Dir, func(ctx context.Context, sessionID string) error {
-		return sendBindingContext(ctx, client, st.URL, st.Dir, sessionID, bindings)
-	})
+	sessionID, err := prep.wait()
 	if sessionID == "" {
 		fmt.Fprintf(stderr, "mars-agent: %v；无法绑定 %s，进入普通 TUI\n", err, joined)
 		return plainAttachCmd(ctx, client, st)
@@ -713,16 +743,17 @@ func planBindCommand(ctx context.Context, env Env, client *http.Client, st maiSt
 // 为了写一条「无绑定」消息凭空制造一个空会话。任何一步失败都只降级为普通 attach，
 // 不让用户进不去沙箱。
 func planUnbindCommand(ctx context.Context, env Env, client *http.Client, st maiState, stderr io.Writer) Cmd {
-	st.ServerReady = serverReady(ctx, client, st.URL)
-	if !st.ServerReady {
+	prep, ready := startSessionPrep(ctx, client, st.URL, st.Dir, stderr, func(rctx context.Context) (string, error) {
+		return withLatestSession(rctx, client, st.URL, st.Dir, func(sctx context.Context, sessionID string) error {
+			return sendUnbindContext(sctx, client, st.URL, st.Dir, sessionID)
+		})
+	})
+	if !ready {
 		fmt.Fprintf(stderr, "mars-agent: 常驻服务未就绪，无法清除绑定；进入普通 TUI\n")
 		st.LocalHasSession = localHasSession(env.AIBin, st.Dir)
 		return planMai(nil, st)
 	}
-	waitMCPBeforeTUI(ctx, st.URL, st.Dir, stderr)
-	sessionID, err := withLatestSession(ctx, client, st.URL, st.Dir, func(ctx context.Context, sessionID string) error {
-		return sendUnbindContext(ctx, client, st.URL, st.Dir, sessionID)
-	})
+	sessionID, err := prep.wait()
 	if sessionID == "" {
 		if err != nil {
 			fmt.Fprintf(stderr, "mars-agent: %v；无法清除绑定，进入普通 TUI\n", err)
@@ -738,15 +769,113 @@ func planUnbindCommand(ctx context.Context, env Env, client *http.Client, st mai
 }
 
 // waitMCPBeforeTUI 在 attach/投递问题前等待 MCP 就绪；超时只告警、不阻断。
-func waitMCPBeforeTUI(ctx context.Context, baseURL, dir string, stderr io.Writer) {
+//
+// ServerVerified 会跳过 waitMCP 内部重复的 health 探测，省掉 busy 内核 1~3s 的
+// 串行等待。调用方要么已确认 server 可达，要么正在并行执行健康探测（见
+// startSessionPrep）：server 实际不可达时，首个 MCP 探测的传输错误会触发一次
+// 归因探测并快速返回，不会盲等整个预算。
+func waitMCPBeforeTUI(ctx context.Context, baseURL, dir string, stderr io.Writer) error {
 	if timeout := mcpWaitTimeout(); timeout > 0 {
-		_ = waitMCP(ctx, baseURL, MCPWaitOptions{
-			Dir:           dir,
-			Timeout:       timeout,
-			ServerTimeout: 0,
-			Log:           stderr,
+		return waitMCP(ctx, baseURL, MCPWaitOptions{
+			Dir:            dir,
+			Timeout:        timeout,
+			ServerVerified: true,
+			ServerTimeout:  0,
+			Log:            stderr,
 		})
 	}
+	return nil
+}
+
+// sessionPrep 并发编排 bind/prompt/unbind 启动前的三条互不依赖链路：
+// 健康探测（决定是否复用常驻 server）、MCP 就绪等待、会话解析/上下文注入。
+//
+// 串行执行时健康探测独占 1~3s 的关键路径；并发后总耗时收敛为三者最大值。
+// 健康探测失败时调用方照旧降级：MCP 等待被取消、会话结果丢弃，功能语义与串行
+// 版本一致。并发期间 server 若尚未监听，会话/MCP 链路可能先以拨号错误失败；
+// wait 会在健康探测确认 server 可达后补做一次，避免把「还没起好」误判成失败。
+//
+// resolve 不得写 stderr：它可能与 MCP 等待同时运行，错误统一由调用方打印。
+type sessionPrep struct {
+	ctx         context.Context
+	baseURL     string
+	dir         string
+	stderr      io.Writer
+	resolve     func(context.Context) (string, error)
+	id          string
+	err         error
+	mcpErr      error
+	leaseDone   chan struct{}
+	mcpDone     chan struct{}
+	cancelMCP   context.CancelFunc
+	cancelLease context.CancelFunc
+}
+
+// startSessionPrep 启动健康探测、MCP 等待、会话解析并返回是否复用常驻 server。
+// 健康探测未通过时调用方应走原有降级路径，此时两条后台链路已取消。
+func startSessionPrep(
+	ctx context.Context,
+	client *http.Client,
+	baseURL, dir string,
+	stderr io.Writer,
+	resolve func(context.Context) (string, error),
+) (*sessionPrep, bool) {
+	mcpCtx, cancelMCP := context.WithCancel(ctx)
+	leaseCtx, cancelLease := context.WithCancel(ctx)
+	p := &sessionPrep{
+		ctx:         ctx,
+		baseURL:     baseURL,
+		dir:         dir,
+		stderr:      stderr,
+		resolve:     resolve,
+		leaseDone:   make(chan struct{}),
+		mcpDone:     make(chan struct{}),
+		cancelMCP:   cancelMCP,
+		cancelLease: cancelLease,
+	}
+	go func() {
+		defer close(p.mcpDone)
+		p.mcpErr = waitMCPBeforeTUI(mcpCtx, baseURL, dir, stderr)
+	}()
+	go func() {
+		defer close(p.leaseDone)
+		p.id, p.err = resolve(leaseCtx)
+	}()
+	if serverReady(ctx, client, baseURL) {
+		return p, true
+	}
+	cancelMCP()
+	cancelLease()
+	// 等两条链路真正退出再返回，避免与调用方的 stderr 输出并发。
+	<-p.mcpDone
+	<-p.leaseDone
+	return p, false
+}
+
+// wait 等待会话解析与 MCP 等待完成，返回会话结果。MCP 失败只告警、不影响返回值。
+func (p *sessionPrep) wait() (string, error) {
+	<-p.leaseDone
+	p.cancelLease()
+	// server 可能在并发期间才监听：会话链路先以拨号错误失败时，健康探测已通过，
+	// 说明 server 就绪，补一次解析，语义与串行版本一致。
+	if p.id == "" && isDialError(p.err) {
+		p.id, p.err = p.resolve(p.ctx)
+	}
+	<-p.mcpDone
+	// MCP 等待若在 server 监听前就快速失败，同样补一次完整等待。
+	if errors.Is(p.mcpErr, errMCPServerUnreachable) {
+		p.mcpErr = waitMCPBeforeTUI(p.ctx, p.baseURL, p.dir, p.stderr)
+	}
+	p.cancelMCP()
+	return p.id, p.err
+}
+
+// isDialError 判断错误是否来自「连接尚未建立」：并发预热的会话请求可能抢在
+// server 监听之前发出，健康探测随后通过时需要补一次，避免把「server 刚起」误判
+// 成「会话查询失败」。只认拨号阶段，读超时等其它错误保持原降级语义。
+func isDialError(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 // serverReady 健康探测加短重试：server 活着但忙时，单次超时过短会把它误判为

@@ -361,8 +361,58 @@ func TestProbeMCPMalformed(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	status, errMsg := probeMCP(ctx, newHTTPClient(0), srv.URL, "/proj")
-	if status != "" || errMsg != "" {
-		t.Errorf("probeMCP() = %q, %q, want 空", status, errMsg)
+	status, errMsg, err := probeMCP(ctx, newHTTPClient(0), srv.URL, "/proj")
+	if status != "" || errMsg != "" || err != nil {
+		t.Errorf("probeMCP() = %q, %q, %v, want 空且无传输错误", status, errMsg, err)
+	}
+}
+
+// TestWaitMCPVerifiedSkipsHealth 验证 ServerVerified 跳过重复的 health 探测：
+// 调用方（mai）刚做过同样探测，热路径不应再等一次 busy 内核的 /api/health。
+func TestWaitMCPVerifiedSkipsHealth(t *testing.T) {
+	var healths int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case healthPath:
+			atomic.AddInt32(&healths, 1)
+			writeHealthy(w)
+		case "/mcp":
+			_, _ = w.Write([]byte(`{"mars-tools":{"status":"connected"}}`))
+		default:
+			t.Errorf("意外路径 %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	clock := newFakeClock(t)
+	err := waitMCPWith(context.Background(), srv.URL,
+		MCPWaitOptions{Dir: "/proj", Timeout: 15, ServerVerified: true}, clock.Now, clock.Sleep)
+	if err != nil {
+		t.Fatalf("waitMCPWith() error = %v", err)
+	}
+	if got := atomic.LoadInt32(&healths); got != 0 {
+		t.Errorf("health 被探测 %d 次, want 0（ServerVerified 应跳过）", got)
+	}
+	if clock.slept != 0 {
+		t.Errorf("sleep 次数 = %d, want 0", clock.slept)
+	}
+}
+
+// TestWaitMCPVerifiedServerDown 验证跳过 health 后仍能在 server 不可达时快速归因，
+// 而不是盲等整个 MCP 预算。
+func TestWaitMCPVerifiedServerDown(t *testing.T) {
+	clock := newFakeClock(t)
+	var log strings.Builder
+	err := waitMCPWith(context.Background(), "http://127.0.0.1:"+closedPort(t),
+		MCPWaitOptions{Dir: "/proj", Timeout: 15, ServerVerified: true, Log: &log},
+		clock.Now, clock.Sleep)
+	if !errors.Is(err, errMCPServerUnreachable) {
+		t.Fatalf("waitMCPWith() error = %v, want errMCPServerUnreachable", err)
+	}
+	if clock.slept != 0 {
+		t.Errorf("sleep 次数 = %d, want 0（不可达应立即返回）", clock.slept)
+	}
+	if !strings.Contains(log.String(), "opencode server 不可达") {
+		t.Errorf("缺少不可达消息: %q", log.String())
 	}
 }
