@@ -1,3 +1,9 @@
+> [!WARNING]
+> **本仓库已废弃（Deprecated），自 2026-11-05 起不再维护。**
+>
+> 不再接受新功能、缺陷修复或安全更新；请勿在新环境中部署本仓库的镜像与 Helm chart。
+> 已有部署请按各自的迁移计划下线或切换，勿继续依赖本仓库。保留此仓库仅为历史存档。
+
 # mars-agent（沙箱侧 AI 助手）
 
 > 仓库：[duc-cnzj/mars-ai-agent](https://github.com/duc-cnzj/mars-ai-agent)。三个名字各司其职：

@@ -5,6 +5,8 @@ type: application
 # 发版时同步提升：version 是 chart 版本，appVersion 是镜像默认 tag（二者都取 vX.Y.Z 口径）。
 version: 0.0.16
 appVersion: "v0.0.16"
+# 仓库已于 2026-11-05 废弃，仅作历史存档，不再发布新版本。
+deprecated: true
 keywords:
   - mars
   - ai
